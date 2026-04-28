@@ -42,6 +42,8 @@ def fused_moe_custom__init__(self, *args, **kwargs):
     self.expert_map_const = (
         self.expert_map.tolist() if self.expert_map is not None else None
     )
+    self.dp_size = self.moe_parallel_config.dp_size
+    self.dp_rank = self.moe_parallel_config.dp_rank
 
 
 # Define custom_moe_glu op for VLLM_RBLN_MOE_CUSTOM_KERNEL
