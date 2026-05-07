@@ -98,7 +98,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
         cache_position = torch.zeros(request_nums, 1, dtype=torch.int32)
 
         kwargs = self.preprocess_for_decoder(
-            is_prompt,
+            False,
             block_tables,
             input_ids,
             cache_position,
@@ -106,15 +106,16 @@ class RBLNOptimumWhisperForConditionalGeneration(
         )
         input_ids = kwargs.pop("input_ids")
         cache_position = kwargs.pop("cache_position")
-        block_tables = kwargs.pop("block_tables")
+        decoder_block_tables = kwargs.pop("block_tables")
 
         if is_prompt:
             _ = self.model.encoder(
-                input_features=input_features, block_tables=block_tables
+                input_features=input_features,
+                block_tables=block_tables.squeeze(-1).to(torch.int16),
             )
 
             decoder_input_ids = torch.full(
-                (request_nums, 1),
+                (self.batch_size, 1),
                 self.model.config.decoder_start_token_id,
                 dtype=torch.long,
             )
@@ -130,7 +131,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 decoder_input_ids=decoder_input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
                 cache_position=cache_position,
-                block_tables=block_tables.unsqueeze(-1),
+                block_tables=decoder_block_tables,
             )
 
         else:
@@ -149,7 +150,7 @@ class RBLNOptimumWhisperForConditionalGeneration(
                 decoder_input_ids=input_ids.contiguous(),
                 decoder_attention_mask=decoder_attention_mask,
                 cache_position=cache_position,
-                block_tables=block_tables,
+                block_tables=decoder_block_tables,
             )
 
         lm_logits = decoder_output.logits
