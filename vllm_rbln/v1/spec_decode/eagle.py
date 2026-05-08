@@ -595,12 +595,11 @@ class RBLNEagleProposer(EagleProposer):
                 else last_hidden_states
             )
             # logits = self.model.compute_logits(sample_hidden_states)
-            # NOTE: Use scatter for RBLN compile instead of compute_logits' in-place remap.
+            # NOTE: Use scatter for RBLN compile instead of compute_logits
             logits = self.model.logits_processor(
                 self.model.lm_head, sample_hidden_states
             )
             if self.model.draft_id_to_target_id is not None:
-                
                 logits = logits[..., : self.model.config.draft_vocab_size]
                 base = torch.arange(
                     self.model.config.draft_vocab_size,
