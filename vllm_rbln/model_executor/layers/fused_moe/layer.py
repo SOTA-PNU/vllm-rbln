@@ -53,6 +53,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
+        scoring_func: str,
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
@@ -91,6 +92,7 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
+        scoring_func: str,
         topk: int,
         post_norm: bool,
         expert_map: torch.Tensor | None = None,
@@ -343,7 +345,7 @@ def unquantized_fused_moe_method_custom(
     tokens_mask = None
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens)
+        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
 
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
@@ -385,6 +387,16 @@ def unquantized_fused_optimize_moe_method_custom(
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
+    # Pre-score routing inputs at caller side; compiler custom op routing
+    # expects already-scored values (no sigmoid applied inside the kernel).
+    scoring_func = getattr(layer, "scoring_func", None)
+    assert scoring_func is not None, "FusedMoE.scoring_func must be set"
+    assert scoring_func in {"softmax", "sigmoid"}
+    if scoring_func == "sigmoid":
+        router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+            router_logits.dtype
+        )
+
     expert_map_const = None
     if layer.expert_map is not None:
         assert getattr(layer, "expert_map_const", None) is not None
@@ -399,12 +411,15 @@ def unquantized_fused_optimize_moe_method_custom(
 
     # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
     # qwen3_moe_architecture.py
+    # Keep argument order aligned with rebel custom_op schema:
+    # (..., router_logits, scoring_func, topk, post_norm, ...)
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
         router_logits,
+        scoring_func,
         layer.top_k,
         layer.renormalize,
         expert_map_const,
