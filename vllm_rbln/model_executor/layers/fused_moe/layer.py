@@ -187,7 +187,7 @@ def unquantized_fused_moe_method_rbln(
     return final_hidden_states.reshape(orig_shape)
 
 
-def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
+def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
     num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
@@ -199,6 +199,8 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0):
         pos < num_tokens_across_dp, left, right
     )  # [dp_size, max_pad]
     tokens_mask = tokens_mask.reshape(-1, 1)  # [dp_size * max_pad, 1]
+    if device is not None:
+        tokens_mask = tokens_mask.to(device)
     return tokens_mask
 
 
@@ -232,7 +234,9 @@ def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(router_logits.shape[0], 1.0, 0.0)
+        tokens_mask = get_tokens_mask(
+            router_logits.shape[0], 1.0, 0.0, device=selected_weights.device
+        )
         selected_weights = selected_weights * tokens_mask
 
     n_expert = router_logits.shape[1]
@@ -362,6 +366,7 @@ def fused_moe_forward_rbln(
         scoring_func = getattr(self, 'scoring_func', 'softmax')
         e_score_correction_bias = getattr(self, 'e_score_correction_bias', None)
 
+        ## FIXME: proper handling for score_func and self.renomalize conditions
         # deepseekv3 style: minimax m2.5
         if scoring_func == 'sigmoid':
             # scores_t = torch.sigmoid(all_router_logits_t)  # [E, R*max_pad]
@@ -393,7 +398,9 @@ def fused_moe_forward_rbln(
         # Apply token mask to zero out padded positions per DP rank
         use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
         if use_moe_tokens_mask:
-            tokens_mask = get_tokens_mask(max_pad).transpose(1, 0)  # [1, R*max_pad]
+            tokens_mask = get_tokens_mask(
+                max_pad, device=masked_routing_weights.device
+            ).transpose(1, 0)  # [1, R*max_pad]
 
             ## token dim padding (dim 0 right pad)
             T = masked_routing_weights.shape[1]
@@ -564,7 +571,9 @@ def fused_moe_forward_rbln(
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens).transpose(1, 0)  # [1, t]
+        tokens_mask = get_tokens_mask(
+            num_tokens, device=masked_routing_weights.device
+        ).transpose(1, 0)  # [1, t]
 
         ## token dim padding (dim 1 right pad)
         T = masked_routing_weights.shape[1]
