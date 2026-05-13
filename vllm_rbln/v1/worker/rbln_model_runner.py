@@ -171,19 +171,12 @@ class AsyncRBLNModelRunnerOutput(AsyncModelRunnerOutput):
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
 
-        # Kick off non-blocking V2H. torch-rbln dispatches contiguous
-        # same-dtype copies to rbln_memcpy_v2h_async; non-direct copies
-        # transparently fall back to sync. Pre-allocate the CPU dst with
-        # torch.empty (avoids PyTorch's pinned-memory allocator path that
-        # would route through PrivateUse1Hooks::getPinnedMemoryAllocator).
         self._sampled_token_ids_cpu = torch.empty(
             self._sampled_token_ids.shape,
             dtype=self._sampled_token_ids.dtype,
             device="cpu",
         )
-        self._sampled_token_ids_cpu.copy_(
-            self._sampled_token_ids, non_blocking=True
-        )
+        self._sampled_token_ids_cpu.copy_(self._sampled_token_ids, non_blocking=True)
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
