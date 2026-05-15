@@ -125,6 +125,7 @@ from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
 from vllm_rbln.torch_compile_backend import (
+    is_warmup_active,
     logged_rbln_backend,
     set_warmup_active,
 )
@@ -136,6 +137,7 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     attach_kv_cache_bindings,
     build_kv_cache_base_bindings,
     build_kv_cache_forward_context_kwargs,
+    materialize_kv_cache_view,
     validate_shared_attention_kv_cache_contiguity,
 )
 from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
@@ -144,6 +146,13 @@ from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
 from vllm_rbln.v1.spec_decode.medusa import RBLNMedusaProposer
 from vllm_rbln.v1.worker.bucketing import get_bucketing_manager
+from vllm_rbln.v1.worker.kv_cache_runtime_hook import (
+    run_kv_cache_runtime_hook,
+)
+from vllm_rbln.v1.worker.kv_cache_torch_hook import (
+    run_kv_cache_torch_hook,
+    set_kv_cache_bases,
+)
 from vllm_rbln.v1.worker.metrics import PerformanceTracker, collect_metrics
 from vllm_rbln.v1.worker.utils import get_kv_cache_names
 
@@ -334,6 +343,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_caches_by_name: dict[str, torch.Tensor] = {}
         self.kv_cache_bases: list[torch.Tensor] = []
         self.kv_cache_view_infos: list[KVCacheViewInfo] = []
         # Initialize in initialize_kv_cache_tensors
@@ -3034,6 +3044,37 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+
+            # User-registered KV cache torch hook: runs after each forward
+            # pass with live per-layer views (on device='rbln' when
+            # VLLM_RBLN_USE_DEVICE_TENSOR=1). Inspect via .to('cpu'); write
+            # back with tensor.copy_(modified.to(tensor.device)).
+            phase_str = "prefill" if is_prefill_phase else "decode"
+            set_kv_cache_bases(self.kv_cache_bases)
+            run_kv_cache_torch_hook(
+                self._kv_cache_layer_tensors(), phase_str
+            )
+
+            # Runtime-instance KV cache hook (rebel_compiler FetchKVCache /
+            # UpdateKVCache). Skipped during warmup — device tensor bindings
+            # are not yet active and fetch raises a native "No device tensor
+            # found" abort that Python try/except cannot catch.
+            if (
+                self.runtime_holder
+                and self.kv_caches_by_name
+                and not is_warmup_active()
+            ):
+                first_layer_t = next(iter(self.kv_caches_by_name.values()))
+                num_blocks = first_layer_t.shape[1]
+                block_size = self.cache_config.block_size
+                run_kv_cache_runtime_hook(
+                    self.runtime_holder[0],
+                    self.kv_caches_by_name,
+                    num_blocks,
+                    block_size,
+                    phase_str,
+                )
+
             if self.performance_tracker is not None:
                 # Record performance metrics
                 model_end_time = time.perf_counter()
@@ -4478,6 +4519,23 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     ) -> dict[str, tuple[torch.Tensor, ...]]:
         return build_kv_cache_forward_context_kwargs(self.kv_cache_bases)
 
+    def _kv_cache_layer_tensors(self) -> list[torch.Tensor]:
+        """Return per-layer KV cache tensors as live views.
+
+        Prefers materializing from dedup'd bases + view_infos when present,
+        falling back to self.kv_caches otherwise. The returned tensors share
+        storage with the runner's KV cache, so in-place writes (e.g. copy_)
+        are visible to the next forward pass.
+        """
+        if self.kv_cache_bases and self.kv_cache_view_infos:
+            print(f"******************** [kv_cache_layer_tensors] kv_cache_bases={len(self.kv_cache_bases)} kv_cache_view_infos={len(self.kv_cache_view_infos)}")
+            return [
+                materialize_kv_cache_view(self.kv_cache_bases, vi)
+                for vi in self.kv_cache_view_infos
+            ]
+        print(f"******************** [kv_cache_layer_tensors] kv_caches={len(self.kv_caches)}")
+        return list(self.kv_caches)
+
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> dict[str, torch.Tensor]:
@@ -4574,6 +4632,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.compile_context.mark_static_address(kv_cache, name)
 
         self._log_kv_cache_info(kv_cache_config, kv_caches)
+        # Keep a layer_name → tensor map for the runtime KV cache hook.
+        self.kv_caches_by_name = dict(kv_caches)
         return kv_caches
 
     def _log_kv_cache_info(
