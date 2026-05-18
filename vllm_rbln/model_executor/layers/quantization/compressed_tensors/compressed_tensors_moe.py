@@ -195,6 +195,16 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
         hidden_states = x.reshape(num_tokens, -1)
         router_logits = router_logits.reshape(num_tokens, -1)
 
+        # Pre-score routing inputs at caller side; compiler custom op routing
+        # expects already-scored values (no sigmoid applied inside the kernel).
+        scoring_func = getattr(layer, "scoring_func", None)
+        assert scoring_func is not None, "FusedMoE.scoring_func must be set"
+        assert scoring_func in {"softmax", "sigmoid"}
+        if scoring_func == "sigmoid":
+            router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
+                router_logits.dtype
+            )
+
         intermediate_size = layer.w2_weight.shape[-1]
 
         gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
@@ -234,6 +244,8 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
             n_group = None
             topk_group = None
 
+        # Keep arg order aligned with rebel custom_op schema:
+        # (..., router_logits, scoring_func, group_size, topk, post_norm, ...)
         final_hidden_states = (
             torch.ops.rbln_custom_ops.custom_moe_swiglu_group_dequantize(
                 hidden_states,
@@ -244,6 +256,7 @@ class CompressedTensorsW8A16Fp8MoEMethod(upstream.CompressedTensorsMoEMethod):
                 down_proj_weight,
                 down_proj_weight_scale,
                 router_logits,
+                scoring_func,
                 torch.tensor(group_size, dtype=torch.int32),
                 layer.top_k,
                 layer.renormalize,
