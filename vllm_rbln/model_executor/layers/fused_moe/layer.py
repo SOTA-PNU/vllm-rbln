@@ -229,8 +229,17 @@ def _apply_grouped_topk_torch(
 ):
     """Apply grouped topk routing in PyTorch.
 
-    Groups experts, selects top groups per token, then applies topk routing
-    within selected groups, and scatters results back to full expert space.
+    Mirrors the relay `_apply_grouped_topk_mask` structure with two branches:
+      * `e_score_correction_bias is not None`: scatter selected groups into a
+        `[T, G, epg]` tensor filled with `-inf`, flatten to `[E, T]`, then run
+        topk routing on the full expert space — bias indices align with expert
+        IDs, so the bias add must happen there.
+      * No bias: run topk routing on the smaller gathered `[topk_group*epg, T]`
+        space, then scatter the result back to `[E, T]`.
+
+    The trailing topk + scatter blocks correspond to relay's
+    `contrib_topk_routing` kernel, so the compiler can pattern-match each
+    branch to a single kernel.
 
     Args:
         router_logits_2d: [T, E] raw router logits.
@@ -264,67 +273,66 @@ def _apply_grouped_topk_torch(
     idx_expanded = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
     gathered = torch.gather(grouped, 1, idx_expanded)  # [T, topk_group, epg]
 
-    # Transpose to [topk_group, epg, T] then flatten to [topk_group*epg, T]
-    gathered_t = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
+    if e_score_correction_bias is not None:
+        # --- with-bias branch ---
+        # Scatter into [T, G, epg] filled with -inf, then flatten to [E, T] so
+        # bias indices line up with expert IDs.
+        minus_inf = torch.full(
+            (T, G, epg),
+            float("-inf"),
+            dtype=gathered.dtype,
+            device=gathered.device,
+        )
+        grouped_masked = minus_inf.scatter(1, idx_expanded, gathered)  # [T, G, epg]
+        # [T, G, epg] -> [G, epg, T] -> [E, T]
+        scores_t = grouped_masked.permute(1, 2, 0).reshape(E, T)
 
-    # Step 5: Apply topk routing on gathered experts
-    if scoring_func == "sigmoid":
-        # gathered is already sigmoid-activated (applied to router_logits_2d above)
-        scores_for_topk = gathered_t
-        if e_score_correction_bias is not None:
-            # Gather bias for selected groups per token
-            bias_grouped = e_score_correction_bias.reshape(G, epg)  # [G, epg]
-            bias_idx = selected_group_idx.unsqueeze(-1).expand(
-                -1, -1, epg
-            )  # [T, topk_group, epg]
-            gathered_bias = torch.gather(
-                bias_grouped.unsqueeze(0).expand(T, -1, -1), 1, bias_idx
-            )  # [T, topk_group, epg]
-            gathered_bias_t = gathered_bias.permute(1, 2, 0).reshape(
-                -1, T
-            )  # [topk_group*epg, T]
-            scores_for_topk = gathered_t + gathered_bias_t
-            _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
-            topk_weights = gathered_t.gather(0, selected_experts)
-        else:
-            topk_weights, selected_experts = torch.topk(
-                scores_for_topk, k=top_k, dim=0
-            )
+        # contrib_topk_routing-equivalent on full [E, T]: bias-shifted topk for
+        # selection, but weights come from the unbiased scores.
+        scores_for_topk = scores_t + e_score_correction_bias.unsqueeze(1)
+        _, selected_experts = torch.topk(scores_for_topk, k=top_k, dim=0)
+        topk_weights = scores_t.gather(0, selected_experts)
+        if scoring_func == "softmax":
+            topk_weights = F.softmax(topk_weights, dim=0)
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(
                 dim=0, keepdim=True
             ).clamp_min(1e-20)
-    elif scoring_func == "softmax":
+
+        result = torch.zeros_like(scores_t)  # [E, T]
+        result.scatter_(0, selected_experts, topk_weights)
+        return result  # [E, T]
+
+    # --- no-bias branch ---
+    # Flatten gathered groups to [topk_group*epg, T] and run topk routing there.
+    gathered_flat = gathered.permute(1, 2, 0).reshape(-1, T)  # [topk_group*epg, T]
+
+    # contrib_topk_routing-equivalent on [topk_group*epg, T]
+    if scoring_func == "softmax":
         if renormalize:
             # post_norm: topk first, then softmax on selected values
-            topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+            topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
             topk_weights = F.softmax(topk_weights, dim=0)
         else:
             # pre_norm: softmax first, then topk
-            sw = F.softmax(gathered_t, dim=0)
+            sw = F.softmax(gathered_flat, dim=0)
             topk_weights, selected_experts = torch.topk(sw, k=top_k, dim=0)
     else:
-        topk_weights, selected_experts = torch.topk(gathered_t, k=top_k, dim=0)
+        topk_weights, selected_experts = torch.topk(gathered_flat, k=top_k, dim=0)
         if renormalize:
             topk_weights = topk_weights / topk_weights.sum(
                 dim=0, keepdim=True
             ).clamp_min(1e-20)
 
-    # Create masked routing in gathered space [topk_group*epg, T]
-    routed_flat = torch.zeros_like(gathered_t)
+    routed_flat = torch.zeros_like(gathered_flat)  # [topk_group*epg, T]
     routed_flat.scatter_(0, selected_experts, topk_weights)
-
-    # Reshape back: [topk_group, epg, T] -> [T, topk_group, epg]
-    routed_3d = routed_flat.reshape(topk_group, epg, T)
-    routed_t = routed_3d.permute(2, 0, 1)  # [T, topk_group, epg]
-
-    # Scatter back to full [T, G, epg]
-    result = torch.zeros(T, G, epg, dtype=routed_t.dtype, device=routed_t.device)
-    idx_expanded = selected_group_idx.unsqueeze(-1).expand(-1, -1, epg)
-    result.scatter_(1, idx_expanded, routed_t)
-
-    # Reshape to [T, E] then transpose to [E, T]
-    return result.reshape(T, E).transpose(0, 1)  # [E, T]
+    # [topk_group*epg, T] -> [topk_group, epg, T] -> [T, topk_group, epg]
+    routed_t = routed_flat.reshape(topk_group, epg, T).permute(2, 0, 1)
+    # Scatter back to full expert space: [T, G, epg]
+    zeros = torch.zeros(T, G, epg, dtype=routed_t.dtype, device=routed_t.device)
+    result_t = zeros.scatter(1, idx_expanded, routed_t)
+    # [T, G, epg] -> [G, epg, T] -> [E, T]
+    return result_t.permute(1, 2, 0).reshape(E, T)
 
 
 # based on custom fused moe expert kernel
