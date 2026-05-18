@@ -2168,7 +2168,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # to reduce the warmup length to a reasonable value for now.
         # This is mainly because we still have to run the computation over
         # the padded tokens in speculative decoding scenario as well.
-        decode_max_seq_len = self.max_model_len // 2
+        decode_max_seq_len = min(
+            self.max_model_len // 2, self.cache_config.block_size // 2
+        )
 
         # compile decode graph considering decode batch buckets
         for batch_bucket_size in self.bucketing_manager.decode_batch_buckets:
