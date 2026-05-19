@@ -1212,10 +1212,10 @@ class RBLNFlashAttentionMetadataBuilder(
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             is_prefill=is_prefill,
             attn_masks=attn_masks,
-            cache_seq_lens=cache_seq_lens.to(self.device)
+            cache_seq_lens=cache_seq_lens.to(self.device).to(torch.int16)
             if cache_seq_lens is not None
             else None,
-            cache_offsets=cache_offsets.to(self.device)
+            cache_offsets=cache_offsets.to(self.device).to(torch.int16)
             if cache_offsets is not None
             else None,
             local_block_tables=local_block_tables.to(self.device)
