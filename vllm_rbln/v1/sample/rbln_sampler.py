@@ -286,6 +286,13 @@ class RBLNSampler(VLLMSampler):
         )
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+        import torch
+        torch._dynamo.graph_break()  # 후속 ops가 같은 graph에 fuse되지 않게 끊기
+        vocab_size = logits.shape[-1]
+        bad = (sampled < 0) | (sampled >= vocab_size)
+        if bad.any():
+            print("OOB sampled:", sampled.tolist(), "vocab:", vocab_size, flush=True)
+            raise RuntimeError("sampled OOB BEFORE gather")
         if processed_logprobs is not None:
             raw_logprobs = processed_logprobs
         # Convert sampled token ids to int64 (long) type to ensure compatibility
