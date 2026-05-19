@@ -46,4 +46,8 @@ jobs:
         set -a
         source ./compiler-version-for-vllm-rbln
         echo "rebel-compiler version: ${COMPILER_VERSION}"
+        if [[ "${COMPILER_VERSION}" != *.prod ]]; then
+          echo "Error: COMPILER_VERSION '${COMPILER_VERSION}' must end with '.prod'"
+          exit 1
+        fi
         echo "COMPILER_VERSION=${COMPILER_VERSION}" >> $GITHUB_OUTPUT
