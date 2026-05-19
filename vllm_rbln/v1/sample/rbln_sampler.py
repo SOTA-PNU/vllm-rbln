@@ -206,8 +206,21 @@ class RBLNTopKTopPSampler(nn.Module):
                 "RBLN Sampling does not support "
                 "per-request generators. Ignoring generators."
             )
+        result = self.top_k_top_p_sample(logits, k, p)
+        vocab_size = 50272
 
-        return self.top_k_top_p_sample(logits, k, p), None
+        bad = (result < 0) | (result >= vocab_size)
+        if bad.any():
+            print(
+                "OOB result (forward_rbln):",
+                result.tolist(),
+                "vocab:",
+                vocab_size,
+                flush=True,
+            )
+            raise RuntimeError("result OOB AFTER top_k_top_p_sample")
+
+        return result, None
 
 
 class RBLNSampler(VLLMSampler):
