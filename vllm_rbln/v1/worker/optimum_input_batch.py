@@ -32,8 +32,10 @@ class RBLNInputBatch(InputBatch):
         if use_rbln_sampler:
             # Overwrite sampling_metadata with RBLN sampling metadata
             self.sampling_metadata = self._make_sampling_metadata_rbln(self.num_reqs)
-            # Default top_k to vocab_size to guard against runtime errors in top_k/top_p ops:
-            # an unset top_k is still used as an index in the fused kernel, so vocab_size
+            # Default top_k to vocab_size to guard
+            # against runtime errors in top_k/top_p ops:
+            # an unset top_k is still used as an index
+            # in the fused kernel, so vocab_size
             # acts as "no filtering" while staying in a valid range.
             #
             # Refs:
