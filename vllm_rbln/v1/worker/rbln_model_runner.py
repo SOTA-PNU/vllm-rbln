@@ -1359,10 +1359,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Verifies past prepend, slot_mapping range, logits-indices
             # exclusion, and effective num_draft_tokens. CPU host code
             # only — outside any compiled model graph. Gated by env var
-            # `VLLM_RBLN_SLIDING_TRACE_REQS` (default 0 = disabled).
+            # `VLLM_RBLN_BACKFILL_TRACE_REQS` (default 0 = disabled).
+            # Naming: variables below keep `sliding`/`slide` for stability;
+            # the env var uses `backfill` to match user-facing docs.
             if not hasattr(self, "_sliding_trace_budget"):
                 self._sliding_trace_budget = int(
-                    os.environ.get("VLLM_RBLN_SLIDING_TRACE_REQS", "0")
+                    os.environ.get("VLLM_RBLN_BACKFILL_TRACE_REQS", "0")
                 )
                 self._sliding_trace_reqs: set[str] = set()
             if slide_distance_map and self._sliding_trace_budget > 0:
@@ -1396,8 +1398,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     ]
                     li_relative = [int(x) - s_dbg for x in li_in_req]
                     ndt_req = int(num_draft_tokens[req_idx_dbg])
-                    logger.info(
-                        "sliding-trace req=%s slide=%d flat_range=[%d,%d) "
+                    logger.debug(
+                        "backfill-trace req=%s slide=%d flat_range=[%d,%d) "
                         "positions=%s input_ids=%s slot_blocks=%s "
                         "logits_indices_in_req=%s (relative_to_req=%s) "
                         "num_draft_tokens=%d",
@@ -1483,7 +1485,11 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_common_prefix_blocks = 0
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
-                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                blk_table_tensor = (
+                    blk_table.get_cpu_tensor()[:num_reqs]
+                    if envs.VLLM_RBLN_USE_DEVICE_TENSOR
+                    else blk_table.get_device_tensor(num_reqs)
+                )
                 slot_mapping = blk_table.slot_mapping.gpu[:total_query_tokens]
 
                 # Fill unused with -1. Needed for reshape_and_cache in full cuda
