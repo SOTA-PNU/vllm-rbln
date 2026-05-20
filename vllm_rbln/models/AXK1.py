@@ -28,7 +28,7 @@ log = logging.getLogger("torch._dynamo")
 
 def __AXK1_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
     shared_output, final_hidden_states = self.experts(
-        hidden_states=hidden_states, router=lambda x: self.gate(x)[0].sigmoid()
+        hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
     )
     if hidden_states.dtype != torch.float16:
         final_hidden_states = final_hidden_states * self.routed_scaling_factor
