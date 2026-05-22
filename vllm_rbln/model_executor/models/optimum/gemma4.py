@@ -16,28 +16,29 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma3_mm import (
-    Gemma3DummyInputsBuilder,
-    Gemma3ImageInputs,
-    Gemma3ImagePixelInputs,
-    Gemma3MultiModalProcessor,
-    Gemma3ProcessingInfo,
+from vllm.model_executor.models.gemma4_mm import (
+    Gemma4DummyInputsBuilder,
+    Gemma4ImageInputs,
+    Gemma4ImagePixelInputs,
+    Gemma4MultiModalProcessor,
+    Gemma4ProcessingInfo,
+    Gemma4AudioInputs,
+    Gemma4VideoInputs,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsMultiModal, MultiModalEmbeddings
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
 from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
-
 logger = init_logger(__name__)
 
 PAD_TOKEN_ID = 0
 
 
-class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
-    def _pad_for_gemma3(self, prompt_ids: list[int]):
+class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
+    def _pad_for_gemma4(self, prompt_ids: list[int]):
         token_type_ids = (
             torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
         )
@@ -63,7 +64,7 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
     def apply(self, *args, **kwargs):
         # NOTE: Check if padding works correctly
         output = super().apply(*args, **kwargs)
-        prompt_ids = self._pad_for_gemma3(output["prompt_token_ids"])
+        prompt_ids = self._pad_for_gemma4(output["prompt_token_ids"])
 
         output["prompt_token_ids"] = prompt_ids
 
@@ -71,11 +72,11 @@ class RBLNGemma3MultiModalProcessor(Gemma3MultiModalProcessor):
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    RBLNGemma3MultiModalProcessor,
-    info=Gemma3ProcessingInfo,
-    dummy_inputs=Gemma3DummyInputsBuilder,
+    RBLNGemma4MultiModalProcessor,
+    info=Gemma4ProcessingInfo,
+    dummy_inputs=Gemma4DummyInputsBuilder,
 )
-class RBLNOptimumGemma3ForConditionalGeneration(
+class RBLNOptimumGemma4ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumDecoderMixin,
     VllmModelForTextGeneration,
@@ -84,6 +85,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
     def __init__(
         self,
         vllm_config: VllmConfig,
+        prefix: str = "",
     ) -> None:
         super().__init__(vllm_config=vllm_config)
         # NOTE:
@@ -105,6 +107,16 @@ class RBLNOptimumGemma3ForConditionalGeneration(
         self.attention_manager: HybridAttentionImageManager = (
             HybridAttentionImageManager(self.strategy)
         )
+        # config = vllm_config.model_config.hf_config
+        with self._mark_language_model(vllm_config):
+            self.language_model = self.model.language_model
+        with self._mark_tower_model(vllm_config, "image"):
+            from transformers import AutoModelForImageTextToText
+            hf_model_id = "google/gemma-4-31B-it"
+            hf_model = AutoModelForImageTextToText.from_pretrained(hf_model_id).to(dtype=torch.bfloat16).eval()
+            self.vision_tower = hf_model.model.vision_tower
+            self.embed_vision = hf_model.model.embed_vision
+            # self.vision_tower = self.model.vision_tower
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
@@ -147,7 +159,7 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             # token_type_ids model_input != token_type_ids of gemma3
             # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
             token_type_ids = torch.zeros_like(input_ids)
-            token_type_ids[input_ids == self.model.config.image_token_index] = 1
+            token_type_ids[input_ids == self.model.config.image_token_id] = 1
 
             pixel_values = self.get_pixel_values(model_input)
             inputs_embeds = self.model._preprocess_prefill(
@@ -157,6 +169,8 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 raise version_error
             assert attention_masks is not None
             attention_mask = attention_masks[0]
+            print("@@@ token_type_ids", token_type_ids)
+            print("@@@@ prefill_decoder", inputs_embeds)
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
@@ -166,15 +180,15 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 token_type_ids=token_type_ids,
             )
             logits = output.logits
-            updated_attention_mask = output.attention_mask
+            # updated_attention_mask = output.attention_mask
             updated_padded_cache_length = output.padded_cache_lengths
-
+            print("@@ attention_mask", attention_mask)
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
                 local_table_id=sliding_window_table_ids[0],
                 pad_len=updated_padded_cache_length,
-                attention_mask=updated_attention_mask,
+                attention_mask=attention_mask.unsqueeze(0), # unused
             )
         else:
             if self.model.language_model.decoders is None:
@@ -197,18 +211,18 @@ class RBLNOptimumGemma3ForConditionalGeneration(
                 attention_masks=attention_masks,
             )
 
-            attention_mask = self.attention_manager.update(
-                running_requests_ids,
-                attention_mask,
-                cache_position,
-            )
+            # attention_mask = self.attention_manager.update(
+            #     running_requests_ids,
+            #     attention_mask,
+            #     cache_position,
+            # )
 
             logits = self.model.language_model.decoder(
                 input_ids=input_ids,
                 cache_position=cache_position,
                 block_tables=block_tables,
                 local_block_tables=local_block_table_id,
-                attention_mask=attention_mask,
+                # attention_mask=attention_mask,
                 position_ids=position_ids,
             ).logits
 
@@ -216,36 +230,138 @@ class RBLNOptimumGemma3ForConditionalGeneration(
             logits = logits[:request_nums]
         return logits
 
+    # def embed_input_ids(
+    #     self,
+    #     input_ids: torch.Tensor,
+    #     multimodal_embeddings: MultiModalEmbeddings | None = None,
+    #     *,
+    #     is_multimodal: torch.Tensor | None = None,
+    # ) -> torch.Tensor:
+    #     # FIXME embed_input_ids in super class?
+    #     # print("@@@ input_ids", input_ids)
+    #     # # This is to satisfy the type checker for each overload
+    #     # if multimodal_embeddings is None or is_multimodal is None:
+    #     #     print("@@@ multimodal_embeddings", multimodal_embeddings)
+    #     #     inputs_embeds = self.model._preprocess_prefill(
+    #     #         input_ids, None, multimodal_embeddings
+    #     #     )
+    #     #     print("@@@ inputs_embeds", inputs_embeds)
+    #     #     return inputs_embeds
+    #     print("@@ multimodal_embeddings", multimodal_embeddings)
+    #     inputs_embeds = self.model._preprocess_prefill(
+    #         input_ids, None, multimodal_embeddings
+    #     )
+    #     print("@@ inputs_embeds", inputs_embeds)
+    #     return inputs_embeds
+
+
+    # ------------------------------------------------------------------ #
+    # Image processing
+    # ------------------------------------------------------------------ #
+
+    def _process_image_input(
+        self,
+        image_input: Gemma4ImageInputs,
+    ):
+        vision_outputs = self.vision_tower(
+            pixel_values=image_input["pixel_values"],
+            pixel_position_id=image_input["pixel_position_id"],
+        )
+        last_hidden_state = vision_outputs.last_hidden_state
+        multimodal_embeddings = self.embed_vision(inputs_embeds=last_hidden_state)
+
+        return multimodal_embeddings
+
+    # ------------------------------------------------------------------ #
+    # MultiModalEmbeddings interface
+    # ------------------------------------------------------------------ #
+
+    # def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+    #     mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
+    #     multimodal_embeddings: list[torch.Tensor] = []
+
+    #     for modality, multimodal_input in mm_input_by_modality.items():
+    #         if multimodal_input is None:
+    #             continue
+    #         if modality == "image":
+    #             multimodal_embeddings.extend(
+    #                 self._process_image_input(multimodal_input)
+    #             )
+    #         else:
+    #             raise NotImplementedError("modality: video, audio")
+            # if modality == "image":
+            #     multimodal_embeddings.extend(
+            #         self._process_image_input(multimodal_input)
+            #     )
+            # elif modality == "video":
+            #     multimodal_embeddings.extend(
+            #         self._process_video_input(multimodal_input)
+            #     )
+            # elif modality == "audio":
+            #     multimodal_embeddings.extend(
+            #         self._process_audio_input(multimodal_input)
+            #     )
+        # print("@@ multimodal_embeddings", multimodal_embeddings)
+        # return multimodal_embeddings
+
+
     def get_pixel_values(self, model_input: ModelInputForRBLN):
         image_input = None
 
         if model_input.multi_modal_kwargs:
-            image_input = self._parse_and_validate_image_input(
+            multimodal_inputs = self._parse_and_validate_multimodal_inputs(
                 **model_input.multi_modal_kwargs
             )
-            if image_input is not None:
-                assert image_input["type"] == "pixel_values"
+            if multimodal_inputs is not None:
+                # FIXME it's different with upstream vllm 0.19.1
+                print("@@ image_input", image_input)
+                # assert image_input["type"] == "pixel_values"
+                image_input = multimodal_inputs["image"]
                 pixel_values = image_input["pixel_values"]
         else:
             pixel_values = None
 
         return pixel_values
 
-    def _parse_and_validate_image_input(
-        self, **kwargs: Any
-    ) -> Gemma3ImageInputs | None:
-        pixel_values = kwargs.pop("pixel_values", None)
-        num_patches = kwargs.pop("num_patches", None)
-        image_embeds = kwargs.pop("image_embeds", None)
-        config = self.vllm_config.model_config.hf_config
+    def _parse_and_validate_multimodal_inputs(
+        self, **kwargs: object
+    ) -> dict[str, Gemma4ImageInputs | Gemma4AudioInputs | Gemma4VideoInputs | None]:
+        mm_input_by_modality = {}
+        for input_key in list(kwargs):
+            if (
+                input_key in ("pixel_values", "image_embeds")
+                and "image" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["image"] = self._parse_and_validate_image_input(
+                    **kwargs
+                )
+            if (
+                input_key == "pixel_values_videos"
+                and "video" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["video"] = self._parse_and_validate_video_input(
+                    **kwargs
+                )
+            if (
+                input_key == "input_features_padded"
+                and "audio" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
+                    **kwargs
+                )
+        print("@@@ mm_input_by_modality", mm_input_by_modality)
+        return mm_input_by_modality
 
-        assert image_embeds is None, "Gemma3 does not support image_embeds."
+    def _parse_and_validate_image_input(
+        self, **kwargs: object
+    ) -> Gemma4ImageInputs | None:
+        pixel_values = kwargs.pop("pixel_values", None)
+        pixel_position_ids = kwargs.pop("pixel_position_ids", None)
+        image_embeds = kwargs.pop("image_embeds", None)
+        assert image_embeds is None, "Gemma4 does not support image_embeds."
         if pixel_values is None:
             return None
-
-        image_size = config.vision_config.image_size
-        return Gemma3ImagePixelInputs(
+        return Gemma4ImagePixelInputs(
             pixel_values=pixel_values,
-            num_patches=num_patches,
-            resolve_bindings={"h": image_size, "w": image_size},
+            pixel_position_ids=pixel_position_ids,
         )
