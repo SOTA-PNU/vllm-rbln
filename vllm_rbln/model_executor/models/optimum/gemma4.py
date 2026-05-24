@@ -16,38 +16,22 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4AudioInputs,
-    Gemma4DummyInputsBuilder,
     Gemma4ImageInputs,
     Gemma4ImagePixelInputs,
-    Gemma4MultiModalProcessor,
-    Gemma4ProcessingInfo,
     Gemma4VideoInputs,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
-from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
-from .optimum_attention import (
-    AttentionManager,
-    InnerAttentionEntry,
-    InnerAttentionStrategy,
-    InnerR1,
-    InnerR2,
-)
+from .optimum_attention import HybridAttentionImageManager, HybridAttentionImageStrategy
 
 logger = init_logger(__name__)
 
 PAD_TOKEN_ID = 0
-_VIDEO_MAX_SOFT_TOKENS = 70  # soft tokens per video frame (vs 280 for images)
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    Gemma4MultiModalProcessor,
-    info=Gemma4ProcessingInfo,
-    dummy_inputs=Gemma4DummyInputsBuilder,
-)
 class RBLNOptimumGemma4ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumDecoderMixin,
@@ -75,10 +59,10 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             decoder_batch_sizes=self.model.rbln_config.language_model.decoder_batch_sizes,
             num_blocks=self.kv_block_adapter._estimated_num_blocks(),
         )
-        self.strategy = InnerAttentionStrategy()
-        self.attention_manager: AttentionManager[
-            InnerAttentionStrategy, InnerAttentionEntry, InnerR1, InnerR2
-        ] = AttentionManager(self.strategy)
+        self.strategy = HybridAttentionImageStrategy(PAD_TOKEN_ID)
+        self.attention_manager: HybridAttentionImageManager = (
+            HybridAttentionImageManager(self.strategy)
+        )
         from transformers import AutoModelForImageTextToText
 
         hf_model_id = "google/gemma-4-31B-it"
@@ -105,11 +89,14 @@ class RBLNOptimumGemma4ForConditionalGeneration(
         request_nums = input_ids.shape[0]
 
         # In prefill phase, the length of list must be 1
-        sliding_window_table_ids = self.attention_manager.get(
-            is_prompt,
-            self.decoder_batch_size,
-            running_requests_ids,
-            finished_requests_ids,
+        sliding_window_table_ids, padded_cache_lengths, attention_masks = (
+            self.attention_manager.get(
+                is_prompt,
+                self.decoder_batch_size,
+                running_requests_ids,
+                finished_requests_ids,
+                input_ids=input_ids,
+            )
         )
 
         kwargs = self.preprocess_for_decoder(
@@ -143,22 +130,33 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             )
             if self.model.language_model.prefill_decoder is None:
                 raise version_error
-
+            assert attention_masks is not None
+            attention_mask = attention_masks[0]
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                # local_block_tables=local_block_table_id,
-                # block_tables=block_tables,
+                local_block_tables=local_block_table_id,
+                block_tables=block_tables,
                 token_type_ids=token_type_ids,
                 batch_idx=0,
             )
             logits = output.logits
+            updated_attention_mask = torch.zeros(
+                1,
+                self.vllm_config.model_config.max_model_len,
+                dtype=torch.bfloat16,  # FIXME attention_mask dtype looks awkward.
+            )
+            # FIXME retrieving update_attention_mask from optimum-rbln looks better.
+            updated_attention_mask[0, : attention_mask.shape[0]].fill_(1)
+            updated_padded_cache_length = output.padded_cache_lengths
+
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
                 running_requests_id=running_requests_ids[0],
                 local_table_id=sliding_window_table_ids[0],
+                pad_len=updated_padded_cache_length,
+                attention_mask=updated_attention_mask,
             )
-            print("[prefill] logits", logits)
         else:
             if self.model.language_model.decoders is None:
                 raise ValueError("Decoders is None")
@@ -166,24 +164,32 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
-            local_block_table_id, cache_position = self.attention_manager.preprocess(
+            (
+                local_block_table_id,
+                cache_position,
+                position_ids,
+                attention_mask,
+            ) = self.attention_manager.preprocess(
                 sliding_window_table_ids,
                 cache_position,
                 request_nums,
                 padded_batch_size,
+                pad_lens=padded_cache_lengths,
+                attention_masks=attention_masks,
             )
-            print("[decode] input_ids", input_ids)
-            print("[decode] cache_position", cache_position)
+            attention_mask = self.attention_manager.update(
+                running_requests_ids,
+                attention_mask,
+                cache_position,
+            )
             logits = self.model.language_model.decoder(
                 input_ids=input_ids,
-                inputs_embeds=None,
                 cache_position=cache_position,
-                # block_tables=block_tables,
-                # local_block_tables=local_block_table_id,
-                position_ids=cache_position.clone(),  # FIXME duplicated
+                block_tables=block_tables,
+                local_block_tables=local_block_table_id,
+                position_ids=cache_position.clone(),  # FIXME duplicated?
+                attention_mask=attention_mask,
             ).logits
-            print("[decode] logits", logits)
-            print("[decode] argmax", logits.argmax(dim=-1))
 
         if not is_prompt:
             logits = logits[:request_nums]
@@ -303,7 +309,7 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
                     **kwargs
                 )
-        print("@@@ mm_input_by_modality", mm_input_by_modality)
+
         return mm_input_by_modality
 
     def _parse_and_validate_image_input(
