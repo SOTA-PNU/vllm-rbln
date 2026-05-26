@@ -274,7 +274,7 @@ def test_no_nan_logits_with_padded_bucket(
         runner = create_model_runner(max_num_seqs=4)
     finally:
         torch.empty = real_empty
-        pass
+
     vocab_size = runner.model_config.get_vocab_size()
 
     reqs = [
