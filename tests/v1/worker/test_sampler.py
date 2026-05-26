@@ -368,7 +368,7 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
 
     runner.model.compute_logits = compute_logits_flaky
 
-    for i in range(2):
+    def run_step(i):
         req = make_request(request_id=f"req_{i}", prompt_token_ids=[1, 2, 3])
         scheduler_output = _schedule_new_request_from_request(
             req, block_ids=([0],), outer_block_ids=[0]
@@ -376,6 +376,15 @@ def test_sampler_logits_reshape_prevents_torch_compile_recompile(monkeypatch):
         runner.execute_model(scheduler_output)
         _ = runner.sample_tokens(grammar_output=None)
 
-    # Should compile only one graph for the sampler.
-    # If recompilation happens, the counter will be more than 3 and fail the assertion.
-    assert compile_counter.frame_count == 3
+    # 1st iter: stride-changed logits — initial compilation happens here.
+    run_step(0)
+    baseline_frames = compile_counter.frame_count
+    assert baseline_frames > 0, "sampler should have been compiled on the first call"
+
+    # 2nd iter: normal-stride logits — reshape in sample_tokens should keep the
+    # sampler input shape/stride identical, so no recompilation should occur.
+    run_step(1)
+    assert compile_counter.frame_count == baseline_frames, (
+        f"sampler recompiled across stride change: "
+        f"{baseline_frames} -> {compile_counter.frame_count}"
+    )
