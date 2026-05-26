@@ -245,16 +245,36 @@ def test_no_nan_logits_with_padded_bucket(
 ):
     """When use_rbln_sampler=True and num_reqs < bucket_size, the pooled tensor
     holding padded logits has unused rows that the sampler still processes with
-    padded sampling metadata. Default temperature=1.0 / top_k=vocab_size in
-    RBLNInputBatch must keep those padded rows from producing NaN that taints
-    the active rows' sampled token ids — for any sampling-param combination.
+    padded sampling metadata. RBLNInputBatch must explicitly initialize every
+    sampling-param tensor's pad rows to safe defaults — otherwise a NaN/garbage
+    value from torch.empty() propagates through penalty / top_k / top_p ops
+    into NaN logits and out-of-vocab sampled tokens.
+
+    To make this deterministic regardless of allocator state, torch.empty is
+    patched during runner construction so every uninitialized float tensor
+    starts as NaN. Any missing init guard in RBLNInputBatch will then surface.
     """
     monkeypatch.setenv("VLLM_RBLN_SAMPLER", "1")
     monkeypatch.setenv("VLLM_RBLN_COMPILE_STRICT_MODE", "1")
     monkeypatch.setenv("VLLM_RBLN_ENABLE_WARM_UP", "False")
 
     # max_num_seqs=4 with 3 reqs -> decode uses bucket_size=4, one padded row.
-    runner = create_model_runner(max_num_seqs=4)
+    # Force torch.empty to return NaN-filled float tensors during init so the
+    # test does not rely on lucky zero-page allocations.
+    real_empty = torch.empty
+
+    def empty_nan(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if t.is_floating_point():
+            t.fill_(float("nan"))
+        return t
+
+    torch.empty = empty_nan
+    try:
+        runner = create_model_runner(max_num_seqs=4)
+    finally:
+        torch.empty = real_empty
+        pass
     vocab_size = runner.model_config.get_vocab_size()
 
     reqs = [
