@@ -16,12 +16,16 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4AudioInputs,
+    Gemma4DummyInputsBuilder,
     Gemma4ImageInputs,
     Gemma4ImagePixelInputs,
+    Gemma4MultiModalProcessor,
+    Gemma4ProcessingInfo,
     Gemma4VideoInputs,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForTextGeneration
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .base import ModelInputForRBLN, version_error
 from .model_base import RBLNOptimumDecoderMixin, RBLNOptimumModelBase
@@ -32,6 +36,74 @@ logger = init_logger(__name__)
 PAD_TOKEN_ID = 0
 
 
+class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
+    def _pad_for_gemma4(self, prompt_ids: list[int]):
+        token_type_ids = (
+            torch.tensor(prompt_ids) == self.info.get_hf_processor().image_token_id
+        )
+        # FIXME: hardcoded prefill chunk size
+        IMAGE_PREFILL_CHUNK_SIZE = 512
+        # Find image block start positions. Unlike Gemma3 (fixed image_seq_length
+        # soft tokens per image), Gemma4 emits a dynamic number of soft tokens per
+        # image, so we detect the start of each contiguous image-token run (a True
+        # whose predecessor is False) instead of assuming a fixed block length.
+        # Shift right by one so each position holds "was the previous token an
+        # image token?", then a block start is "image now AND not image before":
+        #   token_type_ids        [F F T T T F F T T F]
+        #   prev_is_image         [F F F T T T F F T T]   (shifted right)
+        #   now & ~prev (starts)  [. . S . . . . S . .]   -> image_starts = [2, 7]
+        prev_is_image = torch.cat(
+            [token_type_ids.new_zeros(size=(1,)), token_type_ids[:-1]]
+        )
+        image_starts = torch.where(token_type_ids & ~prev_is_image)[0]
+        # TEMP: variable-length image blocks are not fully implemented yet, so for
+        # now every image is assumed to emit a fixed number of soft tokens. Detect
+        # each block's end (mirror of the start logic: shift left so each position
+        # holds "is the next token an image token?", a block end is "image now AND
+        # not image next") and assert the fixed length. Remove this guard once the
+        # dynamic per-image token count above is supported.
+        EXPECTED_IMAGE_TOKENS = 280
+        next_is_image = torch.cat(
+            [token_type_ids[1:], token_type_ids.new_zeros(size=(1,))]
+        )
+        image_ends = torch.where(token_type_ids & ~next_is_image)[0]
+        block_lengths = image_ends - image_starts + 1
+        assert torch.all(block_lengths < EXPECTED_IMAGE_TOKENS), (
+            f"Expected each image block to be {EXPECTED_IMAGE_TOKENS} tokens, "
+            f"got {block_lengths.tolist()}"
+        )
+        padded_seq_len = 0
+        for image_start in image_starts:
+            # Align the block start to the next prefill-chunk boundary so the whole
+            # image block stays within a single prefill chunk. The negation makes
+            # `% chunk` yield the distance UP to the next multiple (0 when already
+            # aligned), instead of the distance past the previous one. With chunk=512:
+            #   pos=530: (-530) % 512 = (-530 + 1024) % 512 = 494  # up to next (1024)
+            #   pos=512: (-512) % 512 = 0                          # already aligned
+            #   pos=0:   (   0) % 512 = 0                          # already aligned
+            #   pos=1:   (  -1) % 512 = 511                        # 511 -> reach 512
+            pos = int(image_start) + padded_seq_len
+            pad_needed = (-pos) % IMAGE_PREFILL_CHUNK_SIZE
+            padded_seq_len += pad_needed
+        # Left padding for Gemma4 image boundary alignment
+        prompt_ids = [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
+        return prompt_ids
+
+    def apply(self, *args, **kwargs):
+        # NOTE: Check if padding works correctly
+        output = super().apply(*args, **kwargs)
+        prompt_ids = self._pad_for_gemma4(output["prompt_token_ids"])
+
+        output["prompt_token_ids"] = prompt_ids
+
+        return output
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    RBLNGemma4MultiModalProcessor,
+    info=Gemma4ProcessingInfo,
+    dummy_inputs=Gemma4DummyInputsBuilder,
+)
 class RBLNOptimumGemma4ForConditionalGeneration(
     RBLNOptimumModelBase,
     RBLNOptimumDecoderMixin,
@@ -63,19 +135,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
         self.attention_manager: HybridAttentionImageManager = (
             HybridAttentionImageManager(self.strategy)
         )
-        from transformers import AutoModelForImageTextToText
-
-        hf_model_id = "google/gemma-4-31B-it"
-        # FIXME It triggers thread creation failure
-        # because of nested multi-threading in multi-processing
-        # libgomp: Thread creation failed: Resource temporarily unavailable
-        hf_model = (
-            AutoModelForImageTextToText.from_pretrained(hf_model_id)
-            .to(dtype=torch.bfloat16)
-            .eval()
-        )
-        self.model.vision_tower = hf_model.model.vision_tower
-        self.model.embed_vision = hf_model.model.embed_vision
 
     def forward(self, model_input: ModelInputForRBLN, **kwargs) -> torch.Tensor:
         input_ids = model_input.input_tokens
@@ -115,12 +174,11 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             inputs_embeds = None
             prefill_batch_idx = sliding_window_table_ids[0]
             local_block_table_id = torch.tensor([prefill_batch_idx], dtype=torch.int16)
-            # FIXME It is disappeared in transformers 5.5.4
-            # token_type_ids model_input != token_type_ids of gemma3
-            # https://github.com/huggingface/transformers/blob/d0c9c66d1c09df3cd70bf036e813d88337b20d4c/src/transformers/models/gemma3/processing_gemma3.py#L143
-            token_type_ids = torch.zeros_like(input_ids)
-            token_type_ids[input_ids == self.model.config.image_token_id] = 1
-
+            # FIXME It should be delivered from runner
+            # FIXME It should allow video_token_ids, audio_token_ids as well.
+            # https://github.com/huggingface/transformers/blob/0588858f54c8c79d28497d3ad6eac3417b716c49/src/transformers/processing_utils.py#L897
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[input_ids == self.model.config.image_token_id] = 1
             pixel_values, image_position_ids = self.get_image_values(model_input)
             inputs_embeds = self.model._preprocess_prefill(
                 input_ids,
@@ -137,18 +195,11 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 cache_position=cache_position,
                 local_block_tables=local_block_table_id,
                 block_tables=block_tables,
-                token_type_ids=token_type_ids,
-                batch_idx=0,
+                token_type_ids=mm_token_type_ids,
             )
             logits = output.logits
-            updated_attention_mask = torch.zeros(
-                1,
-                self.vllm_config.model_config.max_model_len,
-                dtype=torch.bfloat16,  # FIXME attention_mask dtype looks awkward.
-            )
-            # FIXME retrieving update_attention_mask from optimum-rbln looks better.
-            updated_attention_mask[0, : attention_mask.shape[0]].fill_(1)
             updated_padded_cache_length = output.padded_cache_lengths
+            updated_attention_mask = output.attention_mask
 
             assert len(running_requests_ids) == 1
             self.attention_manager.add(
@@ -187,86 +238,13 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 cache_position=cache_position,
                 block_tables=block_tables,
                 local_block_tables=local_block_table_id,
-                position_ids=cache_position.clone(),  # FIXME duplicated?
+                position_ids=position_ids,  # FIXME duplicated?
                 attention_mask=attention_mask,
             ).logits
 
         if not is_prompt:
             logits = logits[:request_nums]
         return logits
-
-    # def embed_input_ids(
-    #     self,
-    #     input_ids: torch.Tensor,
-    #     multimodal_embeddings: MultiModalEmbeddings | None = None,
-    #     *,
-    #     is_multimodal: torch.Tensor | None = None,
-    # ) -> torch.Tensor:
-    #     # FIXME embed_input_ids in super class?
-    #     # print("@@@ input_ids", input_ids)
-    #     # # This is to satisfy the type checker for each overload
-    #     # if multimodal_embeddings is None or is_multimodal is None:
-    #     #     print("@@@ multimodal_embeddings", multimodal_embeddings)
-    #     #     inputs_embeds = self.model._preprocess_prefill(
-    #     #         input_ids, None, multimodal_embeddings
-    #     #     )
-    #     #     print("@@@ inputs_embeds", inputs_embeds)
-    #     #     return inputs_embeds
-    #     print("@@ multimodal_embeddings", multimodal_embeddings)
-    #     inputs_embeds = self.model._preprocess_prefill(
-    #         input_ids, None, multimodal_embeddings
-    #     )
-    #     print("@@ inputs_embeds", inputs_embeds)
-    #     return inputs_embeds
-
-    # ------------------------------------------------------------------ #
-    # Image processing
-    # ------------------------------------------------------------------ #
-
-    # def _process_image_input(
-    #     self,
-    #     image_input: Gemma4ImageInputs,
-    # ):
-    #     vision_outputs = self.vision_tower(
-    #         pixel_values=image_input["pixel_values"],
-    #         pixel_position_id=image_input["pixel_position_id"],
-    #     )
-    #     last_hidden_state = vision_outputs.last_hidden_state
-    #     multimodal_embeddings = self.embed_vision(inputs_embeds=last_hidden_state)
-
-    #     return multimodal_embeddings
-
-    # ------------------------------------------------------------------ #
-    # MultiModalEmbeddings interface
-    # ------------------------------------------------------------------ #
-
-    # def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-    #     mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
-    #     multimodal_embeddings: list[torch.Tensor] = []
-
-    #     for modality, multimodal_input in mm_input_by_modality.items():
-    #         if multimodal_input is None:
-    #             continue
-    #         if modality == "image":
-    #             multimodal_embeddings.extend(
-    #                 self._process_image_input(multimodal_input)
-    #             )
-    #         else:
-    #             raise NotImplementedError("modality: video, audio")
-    # if modality == "image":
-    #     multimodal_embeddings.extend(
-    #         self._process_image_input(multimodal_input)
-    #     )
-    # elif modality == "video":
-    #     multimodal_embeddings.extend(
-    #         self._process_video_input(multimodal_input)
-    #     )
-    # elif modality == "audio":
-    #     multimodal_embeddings.extend(
-    #         self._process_audio_input(multimodal_input)
-    #     )
-    # print("@@ multimodal_embeddings", multimodal_embeddings)
-    # return multimodal_embeddings
 
     def get_image_values(
         self, model_input: ModelInputForRBLN
@@ -295,20 +273,21 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 mm_input_by_modality["image"] = self._parse_and_validate_image_input(
                     **kwargs
                 )
-            if (
-                input_key == "pixel_values_videos"
-                and "video" not in mm_input_by_modality
-            ):
-                mm_input_by_modality["video"] = self._parse_and_validate_video_input(
-                    **kwargs
-                )
-            if (
-                input_key == "input_features_padded"
-                and "audio" not in mm_input_by_modality
-            ):
-                mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
-                    **kwargs
-                )
+            # FIXME Not implemented yet.
+            # if (
+            #     input_key == "pixel_values_videos"
+            #     and "video" not in mm_input_by_modality
+            # ):
+            #     mm_input_by_modality["video"] = self._parse_and_validate_video_input(
+            #         **kwargs
+            #     )
+            # if (
+            #     input_key == "input_features_padded"
+            #     and "audio" not in mm_input_by_modality
+            # ):
+            #     mm_input_by_modality["audio"] = self._parse_and_validate_audio_input(
+            #         **kwargs
+            #     )
 
         return mm_input_by_modality
 
