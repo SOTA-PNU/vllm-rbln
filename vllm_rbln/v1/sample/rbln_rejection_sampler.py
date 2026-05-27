@@ -15,10 +15,12 @@
 # Copied from vllm.v1.sample.rejection_sampler: https://github.com/vllm-project/vllm/blob/v0.13.0/vllm/v1/sample/rejection_sampler.py
 # Search for NOTE(RBLN) or TODO(RBLN) for details
 
+from collections.abc import Sequence
 from dataclasses import replace
 
+import numpy as np
 import torch
-from vllm.v1.outputs import SamplerOutput
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import RejectionSampler, generate_uniform_probs
@@ -146,6 +148,55 @@ class RBLNRejectionSampler(RejectionSampler):
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    @staticmethod
+    def parse_output(
+        output_token_ids: torch.Tensor,
+        vocab_size: int,
+        discard_req_indices: Sequence[int] = (),
+        logprobs_tensors: LogprobsTensors | None = None,
+    ) -> tuple[list[list[int]], LogprobsLists | None]:
+        """RBLN override that also strips trailing token-0 (NUL / ``\\x00``).
+
+        The upstream ``RejectionSampler.parse_output`` builds its valid mask
+        as ``(ids != PLACEHOLDER_TOKEN_ID) & (ids < vocab_size)``. That only
+        drops the rejection sampler's -1 padding and out-of-range ids — a
+        real token id 0 passes through.
+
+        For tokenizers where id 0 is the NUL byte (e.g. MiniMax, where it
+        decodes to ``\\x00``), a verified speculative slot that lands past an
+        EOS can carry a genuine token-0 sampled from the target model. With
+        fixed-length spec decode every step verifies ``num_spec_tokens + 1``
+        positions, so these post-EOS zeros appear as a ``\\x00`` tail of up to
+        ``num_spec_tokens`` characters on the decoded string.
+
+        We treat the first 0 in each row, and everything after it, as
+        invalid. Genuine token-0 output (rare for these tokenizers, since 0 is
+        a non-printable control id) is conservatively dropped only when it is
+        not preceded by other valid tokens in the same step.
+        """
+        output_token_ids_np = output_token_ids.cpu().numpy()
+        # Base mask: drop rejection padding (-1) and out-of-range ids.
+        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+            output_token_ids_np < vocab_size
+        )
+        # Additionally drop the first token-0 and every position after it in
+        # each row (the post-EOS \x00 tail).
+        zero_or_after = np.cumsum(output_token_ids_np == 0, axis=1) > 0
+        valid_mask &= ~zero_or_after
+
+        output_logprobs = None
+        if logprobs_tensors is not None:
+            cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()
+            filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())
+            output_logprobs = filtered_tensors.tolists(cu_num_tokens)
+
+        if len(discard_req_indices) > 0:
+            valid_mask[discard_req_indices] = False
+        outputs = [
+            row[valid_mask[i]].tolist() for i, row in enumerate(output_token_ids_np)
+        ]
+        return outputs, output_logprobs
 
 
 def rejection_sample(
