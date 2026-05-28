@@ -39,9 +39,11 @@ import sys
 
 def main() -> None:
     import vllm_rbln
+
     vllm_rbln.register_ops()
 
     from vllm.entrypoints.cli.main import main as _vllm_main
+
     sys.exit(_vllm_main())
 
 

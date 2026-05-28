@@ -57,8 +57,12 @@ def merge_traces(input_files: list[str], output_file: str) -> int:
 def main():
     parser = argparse.ArgumentParser(description="Merge Chrome Trace JSON files")
     parser.add_argument("inputs", nargs="+", help="Input trace JSON files")
-    parser.add_argument("-o", "--output", default="merged_trace.json",
-                        help="Output file (default: merged_trace.json)")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="merged_trace.json",
+        help="Output file (default: merged_trace.json)",
+    )
     args = parser.parse_args()
     sys.exit(merge_traces(args.inputs, args.output))
 

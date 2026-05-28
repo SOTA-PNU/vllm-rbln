@@ -27,6 +27,7 @@ When tracing is not active, the patched code paths add only a single
 attribute check before falling through to the original implementation.
 """
 
+import contextlib
 import datetime
 import functools
 import os
@@ -57,6 +58,7 @@ def patch_all() -> None:
 # ---------------------------------------------------------------------------
 # EngineCore
 # ---------------------------------------------------------------------------
+
 
 def _patch_engine_core() -> None:
     from vllm.v1.engine.core import EngineCore
@@ -136,8 +138,7 @@ def _patch_engine_core() -> None:
         return (path, count)
 
     # --- _emit_perfetto_step ---
-    def _emit_perfetto_step(self, sched_out, engine_core_outputs,
-                            t0, t1, t2, t3):
+    def _emit_perfetto_step(self, sched_out, engine_core_outputs, t0, t1, t2, t3):
         _ensure_perfetto_attrs(self)
         tr = self._perfetto
         if tr is None:
@@ -155,11 +156,21 @@ def _patch_engine_core() -> None:
             if rid not in self._perfetto_phases:
                 tr.emit_async_begin("request", rid, req_start, cat="lifecycle")
             if arrival is not None and t0 > arrival:
-                tr.emit_duration("queuing", arrival, t0 - arrival, tid=rid,
-                                 cname="thread_state_sleeping")
+                tr.emit_duration(
+                    "queuing",
+                    arrival,
+                    t0 - arrival,
+                    tid=rid,
+                    cname="thread_state_sleeping",
+                )
             self._perfetto_phases[rid] = "prefill"
-            tr.emit_duration("prefill", t1, t2 - t1, tid=rid,
-                             args={"request_id": rid, "num_tokens": ntok})
+            tr.emit_duration(
+                "prefill",
+                t1,
+                t2 - t1,
+                tid=rid,
+                args={"request_id": rid, "num_tokens": ntok},
+            )
 
         # Cached requests
         cached = sched_out.scheduled_cached_reqs
@@ -169,15 +180,25 @@ def _patch_engine_core() -> None:
                 arrival = self._perfetto_arrival.pop(rid, None)
                 tr.emit_async_begin("request", rid, arrival or t0, cat="lifecycle")
                 if arrival is not None and t0 > arrival:
-                    tr.emit_duration("queuing", arrival, t0 - arrival, tid=rid,
-                                     cname="thread_state_sleeping")
+                    tr.emit_duration(
+                        "queuing",
+                        arrival,
+                        t0 - arrival,
+                        tid=rid,
+                        cname="thread_state_sleeping",
+                    )
             if hasattr(cached, "num_output_tokens"):
                 phase = "prefill" if cached.num_output_tokens[i] == 0 else "decode"
             else:
                 phase = "prefill" if ntok > 1 else "decode"
             self._perfetto_phases[rid] = phase
-            tr.emit_duration(phase, t1, t2 - t1, tid=rid,
-                             args={"request_id": rid, "num_tokens": ntok})
+            tr.emit_duration(
+                phase,
+                t1,
+                t2 - t1,
+                tid=rid,
+                args={"request_id": rid, "num_tokens": ntok},
+            )
 
         # Finished requests
         finished_rids = set(sched_out.finished_req_ids)
@@ -229,8 +250,7 @@ def _patch_engine_core() -> None:
         )
         t3 = time.monotonic()
 
-        self._emit_perfetto_step(scheduler_output, engine_core_outputs,
-                                 t0, t1, t2, t3)
+        self._emit_perfetto_step(scheduler_output, engine_core_outputs, t0, t1, t2, t3)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -256,6 +276,7 @@ def _patch_engine_core() -> None:
 # AsyncLLM
 # ---------------------------------------------------------------------------
 
+
 def _patch_async_llm() -> None:
     from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -268,9 +289,7 @@ def _patch_async_llm() -> None:
         )
 
     async def stop_perfetto_trace(self) -> tuple[str, int]:
-        return await self.engine_core.call_utility_async(
-            "stop_perfetto_trace"
-        )
+        return await self.engine_core.call_utility_async("stop_perfetto_trace")
 
     AsyncLLM.start_perfetto_trace = start_perfetto_trace
     AsyncLLM.stop_perfetto_trace = stop_perfetto_trace
@@ -280,6 +299,7 @@ def _patch_async_llm() -> None:
 # ---------------------------------------------------------------------------
 # API server
 # ---------------------------------------------------------------------------
+
 
 def _patch_api_server() -> None:
     """Hook build_app to register /v1/trace/start and /v1/trace/stop.
@@ -325,6 +345,7 @@ def _patch_api_server() -> None:
 # ---------------------------------------------------------------------------
 # vllm bench serve --trace flag
 # ---------------------------------------------------------------------------
+
 
 def _patch_bench_serve() -> None:
     """Add `--trace` flag to `vllm bench serve` that brackets the bench run
@@ -390,8 +411,7 @@ def _patch_bench_serve() -> None:
 
         # --- trace start ---
         try:
-            req = urllib.request.Request(
-                f"{base_url}/v1/trace/start", method="POST")
+            req = urllib.request.Request(f"{base_url}/v1/trace/start", method="POST")
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = _json.loads(resp.read().decode())
                 logger.info("perfetto trace started: %s", data)
@@ -404,7 +424,9 @@ def _patch_bench_serve() -> None:
         except (urllib.error.URLError, OSError, ValueError) as e:
             logger.warning(
                 "perfetto trace start failed (%s). Is the server running "
-                "with vllm_rbln tracing patches?", e)
+                "with vllm_rbln tracing patches?",
+                e,
+            )
 
         # --- run benchmark ---
         try:
@@ -412,8 +434,7 @@ def _patch_bench_serve() -> None:
         finally:
             # --- trace stop ---
             try:
-                req = urllib.request.Request(
-                    f"{base_url}/v1/trace/stop", method="POST")
+                req = urllib.request.Request(f"{base_url}/v1/trace/stop", method="POST")
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = _json.loads(resp.read().decode())
                     logger.info("perfetto trace stopped: %s", data)
@@ -422,8 +443,7 @@ def _patch_bench_serve() -> None:
 
             # --- merge per-pid trace files (same-filesystem assumption) ---
             if ts and server_cwd:
-                pattern = os.path.join(
-                    server_cwd, f"trace_{ts}_pid*.json")
+                pattern = os.path.join(server_cwd, f"trace_{ts}_pid*.json")
                 files = sorted(_glob.glob(pattern))
                 if files:
                     all_events: list[dict] = []
@@ -433,24 +453,21 @@ def _patch_bench_serve() -> None:
                                 ev = _json.load(fh).get("traceEvents", [])
                             all_events.extend(ev)
                         except (OSError, ValueError) as e:
-                            logger.warning(
-                                "skipping %s during merge: %s", f, e)
+                            logger.warning("skipping %s during merge: %s", f, e)
                     all_events.sort(key=lambda e: e.get("ts", 0))
-                    merged_path = os.path.join(
-                        server_cwd, f"trace_{ts}_merged.json")
+                    merged_path = os.path.join(server_cwd, f"trace_{ts}_merged.json")
                     try:
                         with open(merged_path, "w") as fh:
-                            _json.dump(
-                                {"traceEvents": all_events}, fh, indent=0)
+                            _json.dump({"traceEvents": all_events}, fh, indent=0)
                         logger.info(
-                            "perfetto traces merged: %s (%d events "
-                            "from %d files)",
-                            merged_path, len(all_events), len(files))
+                            "perfetto traces merged: %s (%d events from %d files)",
+                            merged_path,
+                            len(all_events),
+                            len(files),
+                        )
                         for f in files:
-                            try:
+                            with contextlib.suppress(OSError):
                                 os.unlink(f)
-                            except OSError:
-                                pass
                     except OSError as e:
                         logger.warning("merge write failed: %s", e)
 
@@ -459,16 +476,15 @@ def _patch_bench_serve() -> None:
                         from vllm_rbln.v1.tracing.analyze import (
                             analyze_merged_trace,
                         )
+
                         analyze_merged_trace(merged_path)
                     except Exception as e:  # noqa: BLE001
-                        logger.warning(
-                            "trace analysis failed: %s", e)
+                        logger.warning("trace analysis failed: %s", e)
 
         return result
 
     serve_mod.main_async = _patched_main_async
-    logger.info(
-        "vllm_rbln.tracing: vllm bench serve --trace flag registered")
+    logger.info("vllm_rbln.tracing: vllm bench serve --trace flag registered")
 
 
 # Apply patches at import time (idempotent via _PATCHED guard).

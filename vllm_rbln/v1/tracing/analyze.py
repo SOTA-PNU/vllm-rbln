@@ -48,15 +48,17 @@ PERCENTILES = (1, 5, 10, 50, 90, 95, 99)
 
 def _parse_trace(events: list[dict]) -> tuple[dict[str, dict], list[int]]:
     """Returns (per_request_stats, all_decode_step_durations_us)."""
-    per_req: dict[str, dict] = defaultdict(lambda: {
-        "arrival_us": None,
-        "queue_dur_us": 0,
-        "prefill_dur_us": 0,
-        "prefill_chunks": 0,
-        "prefill_last_end_us": None,
-        "decode_dur_us": 0,
-        "decode_steps": 0,
-    })
+    per_req: dict[str, dict] = defaultdict(
+        lambda: {
+            "arrival_us": None,
+            "queue_dur_us": 0,
+            "prefill_dur_us": 0,
+            "prefill_chunks": 0,
+            "prefill_last_end_us": None,
+            "decode_dur_us": 0,
+            "decode_steps": 0,
+        }
+    )
     all_decode_step_us: list[int] = []
     for ev in events:
         ph = ev.get("ph")
@@ -76,8 +78,7 @@ def _parse_trace(events: list[dict]) -> tuple[dict[str, dict], list[int]]:
                 r["prefill_dur_us"] += dur
                 r["prefill_chunks"] += 1
                 end = ts + dur
-                if (r["prefill_last_end_us"] is None
-                        or end > r["prefill_last_end_us"]):
+                if r["prefill_last_end_us"] is None or end > r["prefill_last_end_us"]:
                     r["prefill_last_end_us"] = end
             elif name == "decode":
                 r["decode_dur_us"] += dur
@@ -94,15 +95,17 @@ def _build_rows(per_req: dict[str, dict]) -> list[dict]:
         ttft_ms = (r["prefill_last_end_us"] - r["arrival_us"]) / 1e3
         steps = r["decode_steps"]
         decode_ms = r["decode_dur_us"] / 1e3
-        rows.append({
-            "ttft_ms": ttft_ms,
-            "queue_ms": r["queue_dur_us"] / 1e3,
-            "service_ms": r["prefill_dur_us"] / 1e3,
-            "decode_total_ms": decode_ms,
-            "decode_steps": steps,
-            "decode_avg_step_ms": (decode_ms / steps) if steps > 0 else 0.0,
-            "prefill_chunks": r["prefill_chunks"],
-        })
+        rows.append(
+            {
+                "ttft_ms": ttft_ms,
+                "queue_ms": r["queue_dur_us"] / 1e3,
+                "service_ms": r["prefill_dur_us"] / 1e3,
+                "decode_total_ms": decode_ms,
+                "decode_steps": steps,
+                "decode_avg_step_ms": (decode_ms / steps) if steps > 0 else 0.0,
+                "prefill_chunks": r["prefill_chunks"],
+            }
+        )
     return rows
 
 
@@ -111,8 +114,13 @@ def _pct(sorted_arr: list[float], p: float) -> float:
     return sorted_arr[max(0, min(n - 1, int(round(p / 100.0 * (n - 1)))))]
 
 
-def _row(label: str, vals: list[float], sorted_vals: list[float],
-         width: int = 14, fmt: str = ".1f") -> None:
+def _row(
+    label: str,
+    vals: list[float],
+    sorted_vals: list[float],
+    width: int = 14,
+    fmt: str = ".1f",
+) -> None:
     mean = sum(vals) / len(vals) if vals else 0.0
     cells = [mean] + [_pct(sorted_vals, p) for p in PERCENTILES] + [sorted_vals[-1]]
     print(f"{label:<{width}}" + "".join(f"{c:>10{fmt}}" for c in cells))
@@ -177,10 +185,15 @@ def analyze_merged_trace(merged_path: str) -> dict[str, Any] | None:
     print()
 
     # ----- (b) Per-TTFT-percentile breakdown -----
-    print("Per-TTFT-percentile breakdown (representative request at each TTFT percentile):")
-    sub_header = (f"  {'pct':<6}{'ttft':>10}{'queue':>10}{'service':>10}"
-                  f"{'queue%':>9}{'service%':>10}{'dec_total':>12}"
-                  f"{'dec_steps':>11}{'avg_step':>10}")
+    print(
+        "Per-TTFT-percentile breakdown "
+        "(representative request at each TTFT percentile):"
+    )
+    sub_header = (
+        f"  {'pct':<6}{'ttft':>10}{'queue':>10}{'service':>10}"
+        f"{'queue%':>9}{'service%':>10}{'dec_total':>12}"
+        f"{'dec_steps':>11}{'avg_step':>10}"
+    )
     print(sub_header)
     print("  " + "-" * (len(sub_header) - 2))
     for p in PERCENTILES:
@@ -191,11 +204,13 @@ def analyze_merged_trace(merged_path: str) -> dict[str, Any] | None:
         s = r["service_ms"]
         qp = q / t * 100 if t > 0 else 0.0
         sp = s / t * 100 if t > 0 else 0.0
-        print(f"  p{p:<5}{t:>10.1f}{q:>10.1f}{s:>10.1f}"
-              f"{qp:>8.1f}%{sp:>9.1f}%"
-              f"{r['decode_total_ms']:>11.1f} "
-              f"{r['decode_steps']:>10d}"
-              f"{r['decode_avg_step_ms']:>10.2f}")
+        print(
+            f"  p{p:<5}{t:>10.1f}{q:>10.1f}{s:>10.1f}"
+            f"{qp:>8.1f}%{sp:>9.1f}%"
+            f"{r['decode_total_ms']:>11.1f} "
+            f"{r['decode_steps']:>10d}"
+            f"{r['decode_avg_step_ms']:>10.2f}"
+        )
     print()
 
     # ----- (c) Per-decode-step duration distribution -----
@@ -208,9 +223,11 @@ def analyze_merged_trace(merged_path: str) -> dict[str, Any] | None:
         median_step = _pct(decode_step_s, 50)
         p99_step = _pct(decode_step_s, 99)
         max_step = decode_step_s[-1]
-        print(f"  hint: median {median_step:.2f}ms ≈ baseline pure decode; "
-              f"p99 {p99_step:.2f}ms / max {max_step:.2f}ms suggest "
-              "prefill-induced stalls or other interruptions")
+        print(
+            f"  hint: median {median_step:.2f}ms ≈ baseline pure decode; "
+            f"p99 {p99_step:.2f}ms / max {max_step:.2f}ms suggest "
+            "prefill-induced stalls or other interruptions"
+        )
         print()
 
     # ----- (d) Cumulative + interpretation -----

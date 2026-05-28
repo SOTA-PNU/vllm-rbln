@@ -23,6 +23,7 @@ Output files can be opened in https://ui.perfetto.dev/
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -125,19 +126,15 @@ class PerfettoTraceWriter:
         payload = {"traceEvents": events}
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: write to temp file then rename
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self._path.parent), suffix=".tmp"
-        )
+        fd, tmp_path = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(payload, f, indent=0)
             os.replace(tmp_path, str(self._path))
         except BaseException:
             # Clean up temp file on failure
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
-            except OSError:
-                pass
             raise
         return len(events)
 

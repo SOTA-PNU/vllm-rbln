@@ -52,6 +52,7 @@ Env vars (alternative to flags):
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import glob
 import json
@@ -79,22 +80,29 @@ def _split_args(argv: list[str]) -> tuple[dict, list[str]]:
     while i < len(argv):
         a = argv[i]
         if a == "--server-url":
-            opts["server_url"] = argv[i + 1]; i += 2
+            opts["server_url"] = argv[i + 1]
+            i += 2
         elif a == "--server-cwd":
-            opts["server_cwd"] = argv[i + 1]; i += 2
+            opts["server_cwd"] = argv[i + 1]
+            i += 2
         elif a == "--trace-output":
-            opts["trace_output"] = argv[i + 1]; i += 2
+            opts["trace_output"] = argv[i + 1]
+            i += 2
         elif a == "--no-trace":
-            opts["no_trace"] = True; i += 1
+            opts["no_trace"] = True
+            i += 1
         elif a == "--no-sanity":
-            opts["no_sanity"] = True; i += 1
+            opts["no_sanity"] = True
+            i += 1
         elif a == "--keep-pid-traces":
-            opts["keep_pid_traces"] = True; i += 1
+            opts["keep_pid_traces"] = True
+            i += 1
         elif a == "--wrapper-help":
             print(__doc__)
             sys.exit(0)
         else:
-            fwd.append(a); i += 1
+            fwd.append(a)
+            i += 1
     return opts, fwd
 
 
@@ -122,9 +130,11 @@ def _sanity_check(server_url: str) -> None:
     if not needed.issubset(paths):
         missing = needed - set(paths)
         print(f"  ERROR: missing endpoints {sorted(missing)}.")
-        print("         The server must have the vllm_rbln plugin loaded "
-              "(it auto-applies tracing patches). Pass --no-trace / --no-sanity "
-              "to bypass.")
+        print(
+            "         The server must have the vllm_rbln plugin loaded "
+            "(it auto-applies tracing patches). Pass --no-trace / --no-sanity "
+            "to bypass."
+        )
         sys.exit(1)
     print("  OK\n")
 
@@ -176,12 +186,11 @@ def _merge_pid_traces(server_cwd: str, ts: str, output: str, keep: bool) -> None
         print(f"  merged → {output}")
         if not keep:
             for f in files:
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(f)
-                except OSError:
-                    pass
-            print("  cleaned up per-pid trace files "
-                  "(pass --keep-pid-traces to preserve)")
+            print(
+                "  cleaned up per-pid trace files (pass --keep-pid-traces to preserve)"
+            )
     print()
 
 

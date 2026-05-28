@@ -29,10 +29,9 @@ from vllm_rbln.v1.tracing.analyze import analyze_merged_trace
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="Analyze a merged Perfetto trace and print "
-                    "TTFT + decode breakdown.")
-    p.add_argument("trace_json",
-                   help="Path to a merged Perfetto trace JSON file.")
+        description="Analyze a merged Perfetto trace and print TTFT + decode breakdown."
+    )
+    p.add_argument("trace_json", help="Path to a merged Perfetto trace JSON file.")
     args = p.parse_args()
     result = analyze_merged_trace(args.trace_json)
     return 0 if result else 1
