@@ -115,12 +115,6 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
             cursor = e + 1
         # trailing text after the last image block
         out.extend(prompt_ids[cursor:])
-        print("@@@ image_starts", image_starts)
-        print("@@@ added pad tokens", len(out) - len(prompt_ids))
-        print(
-            "@@@ block_info (range_start, pre_pad, block_length, post_pad)",
-            block_info,
-        )
         return out, block_info
 
     def apply(
@@ -266,10 +260,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 # text-only data
                 mm_token_type_ids = torch.zeros_like(input_ids)
             pixel_values, image_position_ids = self.get_image_values(model_input)
-            print("@@@ input_ids", input_ids.shape, input_ids)
-            print("@@@ mm_token_type_ids", mm_token_type_ids)
-            print("@@@ count", (mm_token_type_ids == -1).sum().item())
-            print("@@@ is_embed (from runner)", model_input.is_embed)
             inputs_embeds = self.model._preprocess_prefill(
                 input_ids,
                 inputs_embeds,
@@ -280,7 +270,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 raise version_error
             assert attention_masks is not None
             attention_mask = attention_masks[0]
-            print("@@@ attention_mask", attention_mask)
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
@@ -290,7 +279,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             )
             logits = output.logits
             updated_padded_cache_length = output.padded_cache_lengths
-            print("@@@ updated_padded_cache_length", updated_padded_cache_length)
             updated_attention_mask = output.attention_mask
 
             assert len(running_requests_ids) == 1
@@ -307,7 +295,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             self.model.language_model.decoder = self.model.language_model.decoders[
                 padded_batch_size
             ]
-            print("@@@ [decode] padded_cache_lengths", padded_cache_lengths)
             (
                 local_block_table_id,
                 cache_position,
@@ -326,9 +313,6 @@ class RBLNOptimumGemma4ForConditionalGeneration(
                 attention_mask,
                 cache_position,
             )
-            print("@@@ position_ids", position_ids)
-            print("@@@ input_ids", input_ids)
-            print("@@@ cache_position", cache_position)
             logits = self.model.language_model.decoder(
                 input_ids=input_ids,
                 cache_position=cache_position,

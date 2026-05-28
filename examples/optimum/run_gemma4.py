@@ -48,7 +48,6 @@ def generate_prompts(batch_size: int, model_id: str):
         for i in range(batch_size)
     ]
     images = [[dataset[i]["image"]] for i in range(batch_size)]
-    # images = [[dataset[i]["image"]] for i in range(batch_size)]
 
     texts = processor.apply_chat_template(
         messages,
@@ -111,8 +110,8 @@ async def main(
 
 
 def entry_point(
-    num_input_prompt: int = 5,
-    model_id: str = "./gemma4-31b-b4",
+    num_input_prompt: int = 1,
+    model_id: str = "./gemma4-31b-b1",
 ):
     asyncio.run(
         main(
