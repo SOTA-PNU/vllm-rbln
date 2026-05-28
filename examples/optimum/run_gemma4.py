@@ -47,7 +47,7 @@ def generate_prompts(batch_size: int, model_id: str):
         ]
         for i in range(batch_size)
     ]
-    images = [[dataset[i]["image"], dataset[i]["image"]] for i in range(batch_size)]
+    images = [[dataset[i]["image"]] for i in range(batch_size)]
     # images = [[dataset[i]["image"]] for i in range(batch_size)]
 
     texts = processor.apply_chat_template(
