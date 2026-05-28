@@ -124,7 +124,7 @@ class RBLNOptimumWorker(WorkerBase):
 
             # Directly set PyTorch thread counts
             torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(1)
+
             set_omp_num_threads(self.rank, self.local_rank, num_threads)
         else:
             # Bare metal: use physical cores only (exclude HT siblings).
@@ -149,7 +149,7 @@ class RBLNOptimumWorker(WorkerBase):
 
             # Directly set PyTorch thread counts
             torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(1)
+
             set_omp_num_threads(self.rank, self.local_rank, num_threads)
 
         # Sync numba and torch thread settings to avoid recompilation
