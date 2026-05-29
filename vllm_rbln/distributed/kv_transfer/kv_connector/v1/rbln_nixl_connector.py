@@ -347,3 +347,14 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             return
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
+
+    def get_finished(self) -> tuple[set[str], set[str]]:
+        failed_recv_reqs = set(self._failed_recv_reqs)
+        for req_id in failed_recv_reqs:
+            self._recving_metadata.pop(req_id, None)
+        self._failed_recv_reqs.difference_update(failed_recv_reqs)
+
+        done_sending, done_recving = super().get_finished()
+        if failed_recv_reqs:
+            done_recving = (done_recving or set()) | failed_recv_reqs
+        return done_sending, done_recving
