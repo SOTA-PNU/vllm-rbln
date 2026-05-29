@@ -87,30 +87,52 @@ class RBLNGemma4MultiModalProcessor(Gemma4MultiModalProcessor):
         # (0 when already aligned). Long image blocks (> chunk) span multiple
         # chunks naturally; only the tail of the last chunk needs post-pad.
         # With chunk=512:
-        #   len(out)=530 → (-530) % 512 = 494   # bump to next boundary 1024
-        #   len(out)=512 → 0                    # already aligned
-        #   len(out)=0   → 0                    # already aligned
-        #   len(out)=1   → 511                  # 511 pads → reach 512
+        #   cur_len=530 → (-530) % 512 = 494   # bump to next boundary 1024
+        #   cur_len=512 → 0                    # already aligned
+        #   cur_len=0   → 0                    # already aligned
+        #   cur_len=1   → 511                  # 511 pads → reach 512
+        #
+        # Only the cumulative total `padded_seq_len` is left-padded onto the
+        # prompt at the end, so we don't materialise a list of the would-be
+        # padded prompt — a single running `cur_len` counter is enough to
+        # compute each pre/post-pad amount.
+        # Two cursors run side-by-side over different coordinate systems:
+        #
+        #   original prompt (cursor):  [text 26][image 273][text ...]
+        #                               0       26         299
+        #
+        #   padded prompt (cur_len):   [text 26][PAD 486][image 273][PAD 239][text ...]
+        #                               0       26       512        785      1024
+        #
+        # - cursor : position in the ORIGINAL prompt_ids (no PAD); used to
+        #            slice the next text segment and jump past each image.
+        # - cur_len: length of the HYPOTHETICAL padded prompt so far (includes
+        #            PAD); used to compute each pre/post-pad amount.
+        # Their difference grows by (pre_pad + post_pad) every iteration; at
+        # the end, `cur_len - cursor == padded_seq_len`.
         starts = image_starts.tolist()
         ends = image_ends.tolist()
-        out: list[int] = []
-        cursor = 0
+        cur_len = 0  # running length of the (hypothetical) padded prompt
+        cursor = 0  # running position in the original prompt
+        padded_seq_len = 0  # total PAD tokens to prepend
         for s, e in zip(starts, ends):
             # text / markers (e.g. boi) before this image block
-            out.extend(prompt_ids[cursor:s])
-            print("@@@ pre-pad", (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE)
+            cur_len += s - cursor
             # pre-pad → image block starts on chunk boundary
-            out.extend([PAD_TOKEN_ID] * ((-len(out)) % IMAGE_PREFILL_CHUNK_SIZE))
+            pre_pad = (-cur_len) % IMAGE_PREFILL_CHUNK_SIZE
+            cur_len += pre_pad
+            padded_seq_len += pre_pad
             # image block itself
-            out.extend(prompt_ids[s : e + 1])
-            print("@@@ post-pad", (-len(out)) % IMAGE_PREFILL_CHUNK_SIZE)
+            cur_len += e - s + 1
             # post-pad → next position (eoi / text) starts on chunk boundary
-            out.extend([PAD_TOKEN_ID] * ((-len(out)) % IMAGE_PREFILL_CHUNK_SIZE))
+            post_pad = (-cur_len) % IMAGE_PREFILL_CHUNK_SIZE
+            cur_len += post_pad
+            padded_seq_len += post_pad
             cursor = e + 1
-        # trailing text after the last image block
-        out.extend(prompt_ids[cursor:])
-        print("@@@ total pad", len(out) - len(prompt_ids))
-        return out
+        # Left-pad to inflate the prompt length vLLM sees → vLLM allocates
+        # enough KV-cache blocks. The real chunk-aligned pre/post-pad runs
+        # inside optimum-rbln at attention time (gemma4_runtime_utils.py).
+        return [PAD_TOKEN_ID] * padded_seq_len + prompt_ids
 
     def apply(self, *args, **kwargs):
         # NOTE: Check if padding works correctly
@@ -216,13 +238,13 @@ class RBLNOptimumGemma4ForConditionalGeneration(
             output = self.model.language_model.prefill_decoder(
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
+                attention_mask=attention_mask,
                 local_block_tables=local_block_table_id,
                 block_tables=block_tables,
                 token_type_ids=mm_token_type_ids,
             )
             logits = output.logits
             updated_padded_cache_length = output.padded_cache_lengths
-
             updated_attention_mask = output.attention_mask
 
             assert len(running_requests_ids) == 1

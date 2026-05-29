@@ -111,7 +111,7 @@ async def main(
 
 
 def entry_point(
-    num_input_prompt: int = 1,
+    num_input_prompt: int = 10,
     model_id: str = "/home/eunji.lee/nas_data/0529_models/gemma4-31b-b1-new",
 ):
     asyncio.run(
