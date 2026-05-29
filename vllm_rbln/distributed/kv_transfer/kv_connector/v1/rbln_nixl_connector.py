@@ -241,7 +241,85 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
         super().__init__(vllm_config, engine_id, kv_cache_config)
 
         self.use_host_buffer = self.kv_buffer_device == "cpu"
+        self.kv_transfer_config = vllm_config.kv_transfer_config
 
+    def _remote_nixl_memory_type(self) -> str:
+        assert self.kv_transfer_config is not None
+        configured = self.kv_transfer_config.get_from_extra_config(
+            "remote_nixl_memory_type", None
+        )
+        if configured is not None:
+            return configured
+        if self.use_host_buffer and self.nixl_memory_type == "DRAM":
+            return "VRAM"
+        return self.nixl_memory_type
+
+    def _local_xfer_desc_calls_before_remote(self, remote_engine_id: str) -> int:
+        kv_topo = getattr(self, "kv_topo", None)
+        if kv_topo is None:
+            return 0
+
+        tp_ratio = kv_topo.tp_ratio_from_engine_id(remote_engine_id)
+        if (
+            tp_ratio < 0
+            and not self.use_mla
+            and tp_ratio not in self.src_xfer_handles_by_tp_ratio
+        ):
+            return -tp_ratio
+        return 0
+
+    def _remember_remote_agent_shape(
+        self,
+        remote_engine_id: str,
+        remote_tp_size: int,
+        remote_block_size: int,
+    ) -> None:
+        if remote_engine_id not in self._tp_size:
+            self._tp_size[remote_engine_id] = remote_tp_size
+        if remote_engine_id not in self._block_size:
+            self._block_size[remote_engine_id] = remote_block_size
+
+    def add_remote_agent(
+        self,
+        nixl_agent_meta,
+        remote_tp_rank: int = 0,
+        remote_tp_size: int = 1,
+    ) -> str:
+        remote_memory_type = self._remote_nixl_memory_type()
+        if remote_memory_type == self.nixl_memory_type:
+            return super().add_remote_agent(
+                nixl_agent_meta, remote_tp_rank, remote_tp_size
+            )
+
+        self._remember_remote_agent_shape(
+            nixl_agent_meta.engine_id,
+            remote_tp_size,
+            nixl_agent_meta.block_size,
+        )
+        local_calls_remaining = self._local_xfer_desc_calls_before_remote(
+            nixl_agent_meta.engine_id
+        )
+        remote_call_done = False
+        get_xfer_descs = self.nixl_wrapper.get_xfer_descs
+
+        def get_xfer_descs_with_remote_memory_type(blocks_data, memory_type):
+            nonlocal local_calls_remaining, remote_call_done
+            if local_calls_remaining > 0:
+                local_calls_remaining -= 1
+                return get_xfer_descs(blocks_data, memory_type)
+            if not remote_call_done:
+                remote_call_done = True
+                return get_xfer_descs(blocks_data, remote_memory_type)
+            return get_xfer_descs(blocks_data, memory_type)
+
+        self.nixl_wrapper.get_xfer_descs = get_xfer_descs_with_remote_memory_type
+        try:
+            return super().add_remote_agent(
+                nixl_agent_meta, remote_tp_rank, remote_tp_size
+            )
+        finally:
+            self.nixl_wrapper.get_xfer_descs = get_xfer_descs
+            
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
         Initialize transfer buffer in CPU mem for accelerators
