@@ -1,0 +1,105 @@
+name: PDD test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "run_pdd_once.py"
+      - "scripts/setup_pdd_envs.sh"
+      - "requirements/pdd-*.txt"
+      - "pyproject.toml"
+      - "tests/torch_compile/e2e/v1/kv_connector/nixl_integration/toy_proxy_server.py"
+      - "vllm_rbln/**"
+      - ".github/workflows/pdd_test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pdd-test
+  cancel-in-progress: false
+
+jobs:
+  pdd-test:
+    name: CUDA prefill / RBLN decode
+    runs-on: self-hosted
+    timeout-minutes: 90
+    env:
+      PDD_LOG_ROOT: ${{ github.workspace }}/pdd_logs
+      PDD_RUN_LOG_DIR: ${{ github.workspace }}/pdd_logs/run-${{ github.run_id }}-${{ github.run_attempt }}
+      PDD_VENV_ROOT: ${{ runner.tool_cache }}/pdd-venv
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          nvidia-smi
+          if command -v rbln-stat >/dev/null 2>&1; then
+            rbln-stat
+          fi
+
+          bash scripts/setup_pdd_envs.sh
+
+          test -x "${PDD_VENV_ROOT}/pdd-prefill/bin/vllm"
+          "${PDD_VENV_ROOT}/pdd-prefill/bin/python3" -c \
+            "import nixl, vllm; print('CUDA prefill environment: OK')"
+
+          test -x "${PDD_VENV_ROOT}/pdd-decode/bin/vllm"
+          "${PDD_VENV_ROOT}/pdd-decode/bin/python3" -c \
+            "import nixl, vllm, vllm_rbln; print('RBLN decode environment: OK')"
+
+          python3 run_pdd_once.py \
+            --no-setup \
+            --check-config
+
+      - name: Run and verify PDD
+        shell: bash
+        env:
+          VLLM_LOGGING_LEVEL: DEBUG
+        run: |
+          set -euo pipefail
+          python3 run_pdd_once.py \
+            --ready-timeout-sec 1200 \
+            --log-dir "${PDD_RUN_LOG_DIR}" \
+            --no-setup \
+            --verbose
+
+          decode_log="${PDD_RUN_LOG_DIR}/decode.log"
+          response_json="${PDD_RUN_LOG_DIR}/completion_response.json"
+
+          test -s "${decode_log}"
+          test -s "${response_json}"
+
+          if ! grep -Fq "Converting external KV for" "${decode_log}"; then
+            echo "RBLN decode log does not confirm an external KV transfer" >&2
+            exit 1
+          fi
+
+          "${PDD_VENV_ROOT}/pdd-decode/bin/python3" \
+            -c 'import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          response = json.loads(path.read_text(encoding="utf-8"))
+          choices = response.get("choices")
+          if not isinstance(choices, list) or not choices:
+              raise SystemExit("completion response has no choices")
+          text = choices[0].get("text") if isinstance(choices[0], dict) else None
+          if not isinstance(text, str) or not text.strip():
+              raise SystemExit("completion response has empty choices[0].text")
+          print(f"PDD completion verified: {text!r}")' \
+            "${response_json}"
+
+      - name: Upload PDD logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdd-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: pdd_logs/
+          if-no-files-found: warn
+          retention-days: 14
