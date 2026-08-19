@@ -29,21 +29,25 @@ jobs:
     env:
       PDD_LOG_ROOT: ${{ github.workspace }}/pdd_logs
       PDD_RUN_LOG_DIR: ${{ github.workspace }}/pdd_logs/run-${{ github.run_id }}-${{ github.run_attempt }}
-      RBLN_PYPI_URL: ${{ secrets.RBLN_PYPI_URL }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set venv path
+      - name: Set paths
         shell: bash
         run: |
           set -euo pipefail
           : "${RUNNER_TOOL_CACHE:?RUNNER_TOOL_CACHE is not set}"
+          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
           echo "PDD_VENV_ROOT=${RUNNER_TOOL_CACHE}/pdd-venv" >> "${GITHUB_ENV}"
+          echo "PDD_RUN_CWD=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
 
       - name: Prepare environment
         shell: bash
+        env:
+          RBLN_PYPI_URL: ${{ secrets.RBLN_PYPI_URL }}
+          PIP_NO_INPUT: "1"
         run: |
           set -euo pipefail
           python3 --version
@@ -51,6 +55,7 @@ jobs:
           if command -v rbln-stat >/dev/null 2>&1; then
             rbln-stat
           fi
+          : "${RBLN_PYPI_URL:?RBLN_PYPI_URL secret is not set}"
 
           bash scripts/setup_pdd_envs.sh
 
@@ -59,12 +64,15 @@ jobs:
             rebel-compiler==0.11.1.post1
 
           test -x "${PDD_VENV_ROOT}/pdd-prefill/bin/vllm"
-          "${PDD_VENV_ROOT}/pdd-prefill/bin/python3" -c \
-            "import nixl, vllm; print('CUDA prefill environment: OK')"
-
           test -x "${PDD_VENV_ROOT}/pdd-decode/bin/vllm"
-          "${PDD_VENV_ROOT}/pdd-decode/bin/python3" -c \
-            "import nixl, rebel, vllm, vllm_rbln; print('RBLN decode environment: OK')"
+
+          (
+            cd "${PDD_RUN_CWD}"
+            "${PDD_VENV_ROOT}/pdd-prefill/bin/python3" -c \
+              "from importlib.metadata import entry_points; import nixl, vllm; plugins = {entry.name for entry in entry_points(group='vllm.platform_plugins')}; assert 'rbln' not in plugins, f'RBLN plugin leaked into CUDA prefill: {plugins}'; print('CUDA prefill environment: OK')"
+            "${PDD_VENV_ROOT}/pdd-decode/bin/python3" -c \
+              "from importlib.metadata import entry_points; import nixl, rebel, vllm, vllm_rbln; plugins = {entry.name for entry in entry_points(group='vllm.platform_plugins')}; assert 'rbln' in plugins, f'RBLN plugin missing from decode: {plugins}'; print('RBLN decode environment: OK')"
+          )
 
           python3 run_pdd_once.py \
             --no-setup \
