@@ -88,7 +88,8 @@ jobs:
             --ready-timeout-sec 1200 \
             --log-dir "${PDD_RUN_LOG_DIR}" \
             --no-setup \
-            --verbose
+            --verbose \
+            --prompt "Capital of China is"
 
           decode_log="${PDD_RUN_LOG_DIR}/decode.log"
           response_json="${PDD_RUN_LOG_DIR}/completion_response.json"
