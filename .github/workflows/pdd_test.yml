@@ -29,11 +29,17 @@ jobs:
     env:
       PDD_LOG_ROOT: ${{ github.workspace }}/pdd_logs
       PDD_RUN_LOG_DIR: ${{ github.workspace }}/pdd_logs/run-${{ github.run_id }}-${{ github.run_attempt }}
-      PDD_VENV_ROOT: ${{ runner.tool_cache }}/pdd-venv
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Set venv path
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TOOL_CACHE:?RUNNER_TOOL_CACHE is not set}"
+          echo "PDD_VENV_ROOT=${RUNNER_TOOL_CACHE}/pdd-venv" >> "${GITHUB_ENV}"
 
       - name: Prepare environment
         shell: bash
