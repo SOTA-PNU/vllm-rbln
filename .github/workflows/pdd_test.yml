@@ -29,6 +29,7 @@ jobs:
     env:
       PDD_LOG_ROOT: ${{ github.workspace }}/pdd_logs
       PDD_RUN_LOG_DIR: ${{ github.workspace }}/pdd_logs/run-${{ github.run_id }}-${{ github.run_attempt }}
+      RBLN_PYPI_URL: ${{ secrets.RBLN_PYPI_URL }}
 
     steps:
       - name: Check out repository
@@ -59,7 +60,7 @@ jobs:
 
           test -x "${PDD_VENV_ROOT}/pdd-decode/bin/vllm"
           "${PDD_VENV_ROOT}/pdd-decode/bin/python3" -c \
-            "import nixl, vllm, vllm_rbln; print('RBLN decode environment: OK')"
+            "import nixl, rebel, vllm, vllm_rbln; print('RBLN decode environment: OK')"
 
           python3 run_pdd_once.py \
             --no-setup \
