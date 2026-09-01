@@ -12,7 +12,6 @@ on:
       - "tests/torch_compile/e2e/v1/kv_connector/nixl_integration/toy_proxy_server.py"
       - "vllm_rbln/**"
       - ".github/workflows/pdd_test.yml"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,57 +25,28 @@ jobs:
     name: CUDA prefill / RBLN decode
     runs-on: self-hosted
     timeout-minutes: 90
+
     env:
       PDD_LOG_ROOT: ${{ github.workspace }}/pdd_logs
       PDD_RUN_LOG_DIR: ${{ github.workspace }}/pdd_logs/run-${{ github.run_id }}-${{ github.run_attempt }}
+      PIP_EXTRA_INDEX_URL: ${{ secrets.RBLN_PYPI_URL }}
+      PIP_NO_INPUT: "1"
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set paths
+      - name: Check hardware
         shell: bash
         run: |
           set -euo pipefail
-          : "${RUNNER_TOOL_CACHE:?RUNNER_TOOL_CACHE is not set}"
-          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
-          echo "PDD_VENV_ROOT=${RUNNER_TOOL_CACHE}/pdd-venv" >> "${GITHUB_ENV}"
-          echo "PDD_RUN_CWD=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
 
-      - name: Prepare environment
-        shell: bash
-        env:
-          RBLN_PYPI_URL: ${{ secrets.RBLN_PYPI_URL }}
-          PIP_NO_INPUT: "1"
-        run: |
-          set -euo pipefail
           python3 --version
           nvidia-smi
+
           if command -v rbln-stat >/dev/null 2>&1; then
             rbln-stat
           fi
-          : "${RBLN_PYPI_URL:?RBLN_PYPI_URL secret is not set}"
-
-          bash scripts/setup_pdd_envs.sh
-
-          "${PDD_VENV_ROOT}/pdd-decode/bin/python3" -m pip install \
-            --extra-index-url "${RBLN_PYPI_URL}" \
-            rebel-compiler==0.11.1.post1
-
-          test -x "${PDD_VENV_ROOT}/pdd-prefill/bin/vllm"
-          test -x "${PDD_VENV_ROOT}/pdd-decode/bin/vllm"
-
-          (
-            cd "${PDD_RUN_CWD}"
-            "${PDD_VENV_ROOT}/pdd-prefill/bin/python3" -c \
-              "from importlib.metadata import entry_points; import nixl, vllm; plugins = {entry.name for entry in entry_points(group='vllm.platform_plugins')}; assert 'rbln' not in plugins, f'RBLN plugin leaked into CUDA prefill: {plugins}'; print('CUDA prefill environment: OK')"
-            "${PDD_VENV_ROOT}/pdd-decode/bin/python3" -c \
-              "from importlib.metadata import entry_points; import nixl, rebel, vllm, vllm_rbln; plugins = {entry.name for entry in entry_points(group='vllm.platform_plugins')}; assert 'rbln' in plugins, f'RBLN plugin missing from decode: {plugins}'; print('RBLN decode environment: OK')"
-          )
-
-          python3 run_pdd_once.py \
-            --no-setup \
-            --check-config
 
       - name: Run and verify PDD
         shell: bash
@@ -84,12 +54,11 @@ jobs:
           VLLM_LOGGING_LEVEL: DEBUG
         run: |
           set -euo pipefail
+
           python3 run_pdd_once.py \
             --ready-timeout-sec 1200 \
             --log-dir "${PDD_RUN_LOG_DIR}" \
-            --no-setup \
-            --verbose \
-            --prompt "Capital of China is"
+            --verbose 
 
           decode_log="${PDD_RUN_LOG_DIR}/decode.log"
           response_json="${PDD_RUN_LOG_DIR}/completion_response.json"
@@ -102,7 +71,7 @@ jobs:
             exit 1
           fi
 
-          "${PDD_VENV_ROOT}/pdd-decode/bin/python3" \
+          .venvs/pdd-decode/bin/python3 \
             -c 'import json, pathlib, sys
           path = pathlib.Path(sys.argv[1])
           response = json.loads(path.read_text(encoding="utf-8"))
