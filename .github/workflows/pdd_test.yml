@@ -48,6 +48,16 @@ jobs:
             rbln-stat
           fi
 
+      - name: Prepare PDD environments
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bash scripts/setup_pdd_envs.sh
+          .venvs/pdd-decode/bin/python3 -m pip install rebel-compiler
+          .venvs/pdd-decode/bin/python3 -c \
+            'import rebel; print(f"rebel import OK: {rebel.__file__}")'
+
       - name: Run and verify PDD
         shell: bash
         env:
