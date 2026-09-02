@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import os
+from pathlib import Path
+
 import run_pdd_once as runner
 
 def _replace(cmd: list[str], option: str, value: str) -> None:
@@ -16,9 +18,15 @@ def _gpu_decode_cmd(*args):
     return cmd
 
 def _configure() -> None:
+    gpu_pd_venv = Path(
+        os.environ.get("PDD_GPU_PD_VENV", runner.VENV_ROOT / "gpu-pd")
+    ).expanduser().resolve()
+    runner.CUDA_PREFILL_VENV = gpu_pd_venv
+    runner.CUDA_VLLM_BIN = gpu_pd_venv / "bin/vllm"
     runner.RBLN_VLLM_BIN = runner.CUDA_VLLM_BIN
-    runner.RBLN_PYTHON_BIN = runner.CUDA_PREFILL_VENV / "bin/python3"
-    runner.RBLN_DECODE_VENV = runner.CUDA_PREFILL_VENV
+    runner.RBLN_PYTHON_BIN = gpu_pd_venv / "bin/python3"
+    runner.RBLN_DECODE_VENV = gpu_pd_venv
+    runner.SETUP_SCRIPT = runner.SCRIPT_DIR / "scripts/setup_gpu_pd_env.sh"
     runner.DECODE_KV_CONNECTOR_NAME = "NixlConnector"
     runner.BLOCK_SIZE = int(os.environ.get("PDD_GPU_BLOCK_SIZE", "16"))
     runner._build_decode_cmd = _gpu_decode_cmd

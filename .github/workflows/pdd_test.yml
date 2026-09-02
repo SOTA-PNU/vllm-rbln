@@ -7,6 +7,7 @@ on:
     paths:
       - "run_pdd_once.py"
       - "run_gpu_pdd_once.py"
+      - "scripts/setup_gpu_pd_env.sh"
       - "scripts/setup_pdd_envs.sh"
       - "requirements/pdd-*.txt"
       - "pyproject.toml"
@@ -26,10 +27,6 @@ jobs:
     name: GPU Baseline
     runs-on: self-hosted
     timeout-minutes: 90
-    env:
-      PIP_EXTRA_INDEX_URL: ${{ secrets.RBLN_PYPI_URL }}
-      PIP_NO_INPUT: "1"
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -40,7 +37,7 @@ jobs:
           set -euo pipefail
           python3 --version
           nvidia-smi
-          bash scripts/setup_pdd_envs.sh
+          bash scripts/setup_gpu_pd_env.sh
 
       - name: Run GPU baseline
         shell: bash
@@ -66,10 +63,6 @@ jobs:
     needs: gpu-baseline
     runs-on: self-hosted
     timeout-minutes: 90
-    env:
-      PIP_EXTRA_INDEX_URL: ${{ secrets.RBLN_PYPI_URL }}
-      PIP_NO_INPUT: "1"
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
