@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+import os
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
@@ -2650,6 +2651,10 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                 }
                 kv_transfer_group.register_kv_caches(filtered_kv_caches)
 
+            layout_reorder_enabled = (
+                os.environ.get("VLLM_RBLN_PDD_LAYOUT_REORDER", "0") == "1"
+            )
+
             def rbln_copy_kv_blocks(
                 src_kv_caches: dict[str, torch.Tensor],
                 dst_kv_caches: dict[str, torch.Tensor],
@@ -2672,17 +2677,43 @@ class RBLNModelRunner(KVConnectorModelRunnerMixin):
                     "src_block_ids and dst_block_ids must be the same: "
                     f"src_block_ids={src_block_ids} dst_block_ids={dst_block_ids}"
                 )
+                reorder_this_copy = layout_reorder_enabled and direction == "h2d"
                 # P/D uses identical block ids on both sides (asserted above), so
-                # the copy indexes by src_block_ids; it is symmetric, so the
-                # direction arg (part of the fixed CopyBlocksOp signature) is
-                # unused.
+                # the copy indexes by src_block_ids. The opt-in layout correction
+                # is limited to H2D; the control path remains symmetric.
                 for layer_name, dst_cache in dst_kv_caches.items():
                     src_cache = src_kv_caches[layer_name]
+                    if reorder_this_copy:
+                        assert src_cache.shape[0] == dst_cache.shape[0] == 2
                     for kv in range(dst_cache.shape[0]):
                         dst_kv = dst_cache[kv]
                         src_kv = src_cache[kv]
                         for idx in src_block_ids:
-                            dst_kv[idx].copy_(src_kv[idx])
+                            src_block = src_kv[idx]
+                            dst_block = dst_kv[idx]
+                            if reorder_this_copy:
+                                assert src_block.is_contiguous()
+                                assert src_block.dtype == dst_block.dtype
+                                assert (
+                                    src_block.element_size()
+                                    == dst_block.element_size()
+                                    == 2
+                                )
+                                assert src_block.numel() == dst_block.numel()
+                                assert src_block.ndim == dst_block.ndim == 4
+                                h, singleton, t, d = dst_block.shape
+                                assert singleton == 1
+                                source_view = src_block.view(-1).view(t, h, d)
+                                corrected = (
+                                    source_view.permute(1, 0, 2)
+                                    .unsqueeze(1)
+                                    .contiguous()
+                                )
+                                assert corrected.shape == dst_block.shape
+                                assert corrected.dtype == dst_block.dtype
+                                dst_block.copy_(corrected)
+                            else:
+                                dst_block.copy_(src_block)
 
             kv_transfer_group.set_host_xfer_buffer_ops(rbln_copy_kv_blocks)
 
