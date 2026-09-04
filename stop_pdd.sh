@@ -1,38 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly EXPECTED_REPO=/home/jiwon_lee/sota/vllm-rbln-0.11.1-2_native_dtype
-readonly RESULT_ROOT=/home/jiwon_lee/sota/profile-results
-readonly CUDA_PY=/home/jiwon_lee/.venvs/official0111-cuda-20260903-121127/bin/python3
-
-export PYTHONNOUSERSITE=1
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONHASHSEED=0
-export PYTHONPATH="$EXPECTED_REPO"
-export VLLM_RBLN_PDD_LAYOUT_REORDER=1
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=0
-export RBLN_DEVICES=0
+SCRIPT_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+    pwd -P
+)"
+REPO="${REPO:-$SCRIPT_DIR}"
+RESULT_ROOT="${RESULT_ROOT:-$HOME/vllm-rbln-profile-results}"
+EXPECTED_BRANCH=0.11.1-2_native_dtype
+REQUIRED_LAYOUT_COMMIT=972ce20cf53b0d2d50c4155f9d44be6879ede966
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
-}
-
-latest_result_dir() {
-    local latest=
-    local candidate
-    [[ -d "$RESULT_ROOT" ]] || return 1
-    while IFS= read -r -d '' candidate; do
-        if [[ -z "$latest" || "$candidate" -nt "$latest" ]]; then
-            latest=$candidate
-        fi
-    done < <(find "$RESULT_ROOT" -mindepth 1 -maxdepth 1 -type d \
-        -name 'native-dtype-*' -print0)
-    [[ -n "$latest" ]] || return 1
-    printf '%s\n' "$latest"
 }
 
 proc_fields() {
@@ -93,7 +73,7 @@ snapshot_unrelated() {
     while read -r pid pgid args; do
         [[ "$pid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ ]] || continue
         case "$args" in
-            *vllm.entrypoints.cli.main*serve*|*layout_proxy.py*) ;;
+            *vllm.entrypoints.cli.main*serve*|*pdd_profile_proxy.py*) ;;
             *) continue ;;
         esac
         if [[ "$pgid" == "${PREFILL_PGID:-}" || \
@@ -235,21 +215,39 @@ verify_unrelated() {
     return "$failed"
 }
 
-if [[ -z "${RESULT_DIR:-}" ]]; then
-    RESULT_DIR=$(latest_result_dir) || die "no native-dtype result directory exists"
-fi
+[[ -n "${RESULT_DIR:-}" ]] || \
+    die "RESULT_DIR is required for PID-scoped cleanup"
 RESULT_DIR=$(realpath -e -- "$RESULT_DIR") || die "RESULT_DIR does not exist"
-[[ "$RESULT_DIR" == "$RESULT_ROOT"/native-dtype-* ]] || \
-    die "RESULT_DIR is outside the native-dtype result root"
+[[ -f "$RESULT_DIR/runtime.env" ]] || die "runtime.env is missing in RESULT_DIR"
 [[ -f "$RESULT_DIR/pids.env" ]] || die "pids.env is missing in RESULT_DIR"
 SELECTED_RESULT_DIR=$RESULT_DIR
 command -v flock >/dev/null 2>&1 || die "flock is required for start/stop serialization"
-exec {START_LOCK_FD}<"$RESULT_ROOT"
-flock --exclusive "$START_LOCK_FD"
 
+set -a
+# shellcheck disable=SC1090
+source "$RESULT_DIR/runtime.env"
 # shellcheck disable=SC1090
 source "$RESULT_DIR/pids.env"
-[[ "$RESULT_DIR" == "$SELECTED_RESULT_DIR" ]] || die "pids.env RESULT_DIR mismatch"
+set +a
+[[ "${RESULT_DIR:-}" == "$SELECTED_RESULT_DIR" ]] || die "recorded RESULT_DIR mismatch"
+[[ -d "${RESULT_ROOT:-}" ]] || die "recorded RESULT_ROOT does not exist"
+[[ -d "${REPO:-}" ]] || die "recorded repository does not exist"
+ACTUAL_COMMIT=$(git -C "$REPO" rev-parse HEAD) || die "cannot read recorded repository HEAD"
+[[ "$ACTUAL_COMMIT" == "${COMMIT:-}" ]] || \
+    die "recorded commit does not match repository HEAD"
+ACTUAL_BRANCH=$(git -C "$REPO" branch --show-current) || \
+    die "cannot read recorded repository branch"
+if [[ -n "$ACTUAL_BRANCH" && "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]]; then
+    die "branch mismatch: expected $EXPECTED_BRANCH or detached HEAD, got $ACTUAL_BRANCH"
+fi
+git -C "$REPO" merge-base --is-ancestor \
+    "$REQUIRED_LAYOUT_COMMIT" "$ACTUAL_COMMIT" || \
+    die "required layout commit is not an ancestor"
+[[ -x "${CUDA_PY:-}" ]] || die "recorded CUDA_PY is unavailable"
+[[ "${RBLN_DEVICE:-}" =~ ^[0-9]+$ ]] || die "recorded RBLN_DEVICE is invalid"
+
+exec {START_LOCK_FD}<"$RESULT_ROOT"
+flock --exclusive "$START_LOCK_FD"
 
 FAILURE=0
 validate_role PROXY || FAILURE=1
@@ -332,17 +330,20 @@ RBLN_STATE_FILE="$RESULT_DIR/rbln_smi_after_stop.json"
 if command -v rbln-smi >/dev/null 2>&1; then
     for ((attempt = 0; attempt < 10; attempt++)); do
         if rbln-smi --json >"$RBLN_STATE_FILE" 2>/dev/null && \
-           "$CUDA_PY" - "${DECODE_PID:-}" "$RBLN_STATE_FILE" <<'PY'
+           "$CUDA_PY" - "${DECODE_PID:-}" "$RBLN_STATE_FILE" "$RBLN_DEVICE" <<'PY'
 import json
 import sys
 
 decode_pid = str(sys.argv[1])
+device_id = str(sys.argv[3])
 with open(sys.argv[2], encoding="utf-8") as handle:
     doc = json.load(handle)
 for context in doc.get("contexts", []):
     marker = str(context.get("npu", context.get("device", ""))).lower()
     serialized = json.dumps(context, sort_keys=True)
-    if marker in {"0", "rbln0"} or (decode_pid and decode_pid in serialized):
+    if marker in {device_id, f"rbln{device_id}"} or (
+        decode_pid and decode_pid in serialized
+    ):
         raise SystemExit(1)
 PY
         then
@@ -353,7 +354,8 @@ PY
     done
 fi
 if (( RBLN_CLEAR == 0 )); then
-    printf 'ERROR: an RBLN device-0 context remains after recorded process cleanup\n' >&2
+    printf 'ERROR: an RBLN device-%s context remains after recorded process cleanup\n' \
+        "$RBLN_DEVICE" >&2
     FAILURE=1
 fi
 

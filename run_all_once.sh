@@ -1,36 +1,40 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_DIR=/home/jiwon_lee/sota/profile-handoff-0.11.1-2_native_dtype
-readonly REPO=/home/jiwon_lee/sota/vllm-rbln-0.11.1-2_native_dtype
-readonly RESULT_ROOT=/home/jiwon_lee/sota/profile-results
+SCRIPT_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+    pwd -P
+)"
+REPO="${REPO:-$SCRIPT_DIR}"
+RESULT_ROOT="${RESULT_ROOT:-$HOME/vllm-rbln-profile-results}"
 
-export PYTHONNOUSERSITE=1
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONHASHSEED=0
-export PYTHONPATH="$REPO"
-export VLLM_RBLN_PDD_LAYOUT_REORDER=1
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=0
-export RBLN_DEVICES=0
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
 
-latest_result_dir() {
-    local latest=
+mkdir -p -- "$RESULT_ROOT" || die "cannot create RESULT_ROOT: $RESULT_ROOT"
+RESULT_ROOT=$(cd -- "$RESULT_ROOT" >/dev/null 2>&1 && pwd -P) || \
+    die "cannot resolve RESULT_ROOT: $RESULT_ROOT"
+export REPO RESULT_ROOT
+
+PDD_RUN_TOKEN="runall-$$-${RANDOM}"
+export PDD_RUN_TOKEN
+
+owned_result_dir() {
+    local owned=
     local candidate
     [[ -d "$RESULT_ROOT" ]] || return 1
     while IFS= read -r -d '' candidate; do
-        if [[ -z "$latest" || "$candidate" -nt "$latest" ]]; then
-            latest=$candidate
+        if [[ -z "$owned" || "$candidate" -nt "$owned" ]]; then
+            owned=$candidate
         fi
     done < <(find "$RESULT_ROOT" -mindepth 1 -maxdepth 1 -type d \
-        -name 'native-dtype-*' -print0)
-    [[ -n "$latest" ]] || return 1
-    printf '%s\n' "$latest"
+        -name "native-dtype-*-$PDD_RUN_TOKEN" -print0)
+    [[ -n "$owned" ]] || return 1
+    printf '%s\n' "$owned"
 }
 
-BEFORE_RESULT=$(latest_result_dir || true)
 RESULT_DIR=
 
 cleanup() {
@@ -45,9 +49,8 @@ cleanup() {
         status=143
     fi
     if [[ -z "$RESULT_DIR" ]]; then
-        candidate=$(latest_result_dir || true)
-        if [[ -n "$candidate" && "$candidate" != "$BEFORE_RESULT" && \
-              -f "$candidate/pids.env" ]]; then
+        candidate=$(owned_result_dir || true)
+        if [[ -n "$candidate" && -f "$candidate/pids.env" ]]; then
             RESULT_DIR=$candidate
         fi
     fi

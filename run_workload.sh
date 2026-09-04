@@ -1,22 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly EXPECTED_REPO=/home/jiwon_lee/sota/vllm-rbln-0.11.1-2_native_dtype
-readonly EXPECTED_COMMIT=972ce20cf53b0d2d50c4155f9d44be6879ede966
-readonly RESULT_ROOT=/home/jiwon_lee/sota/profile-results
-readonly PROMPT_SOURCE=/home/jiwon_lee/sota/experiments/official0111-native-kv-20260903-121127/12_prompts.json
-readonly DEFAULT_CUDA_PY=/home/jiwon_lee/.venvs/official0111-cuda-20260903-121127/bin/python3
-
-export PYTHONNOUSERSITE=1
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONHASHSEED=0
-export PYTHONPATH="$EXPECTED_REPO"
-export VLLM_RBLN_PDD_LAYOUT_REORDER=1
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=0
-export RBLN_DEVICES=0
+SCRIPT_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+    pwd -P
+)"
+REPO="${REPO:-$SCRIPT_DIR}"
+RESULT_ROOT="${RESULT_ROOT:-$HOME/vllm-rbln-profile-results}"
+EXPECTED_BRANCH=0.11.1-2_native_dtype
+REQUIRED_LAYOUT_COMMIT=972ce20cf53b0d2d50c4155f9d44be6879ede966
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -49,32 +41,51 @@ PROMPT_MODE=${PROMPT_MODE:-long}
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS must be a positive integer"
 [[ "$PROMPT_MODE" == short || "$PROMPT_MODE" == long ]] || \
     die "PROMPT_MODE must be short or long"
-[[ -f "$PROMPT_SOURCE" ]] || die "prompt source is missing"
 
 if [[ -z "${RESULT_DIR:-}" ]]; then
     RESULT_DIR=$(latest_result_dir) || die "no native-dtype result directory exists"
 fi
 RESULT_DIR=$(realpath -e -- "$RESULT_DIR") || die "RESULT_DIR does not exist"
-[[ "$RESULT_DIR" == "$RESULT_ROOT"/native-dtype-* ]] || \
-    die "RESULT_DIR is outside the native-dtype result root"
 [[ -f "$RESULT_DIR/runtime.env" ]] || die "runtime.env is missing in RESULT_DIR"
+[[ -f "$RESULT_DIR/pids.env" ]] || die "pids.env is missing in RESULT_DIR"
 SELECTED_RESULT_DIR=$RESULT_DIR
 
 set -a
 # shellcheck disable=SC1090
 source "$RESULT_DIR/runtime.env"
+# shellcheck disable=SC1090
+source "$RESULT_DIR/pids.env"
 set +a
-[[ "$RESULT_DIR" == "$SELECTED_RESULT_DIR" ]] || die "runtime.env RESULT_DIR mismatch"
-[[ "${REPO:-}" == "$EXPECTED_REPO" ]] || die "runtime candidate repository mismatch"
-[[ "${COMMIT:-}" == "$EXPECTED_COMMIT" ]] || die "runtime candidate commit mismatch"
-[[ "${VLLM_RBLN_PDD_LAYOUT_REORDER:-}" == 1 ]] || die "layout reorder is not enabled"
+[[ "${RESULT_DIR:-}" == "$SELECTED_RESULT_DIR" ]] || die "recorded RESULT_DIR mismatch"
+[[ -d "${REPO:-}" ]] || die "recorded repository does not exist"
+ACTUAL_COMMIT=$(git -C "$REPO" rev-parse HEAD) || die "cannot read recorded repository HEAD"
+[[ "$ACTUAL_COMMIT" == "${COMMIT:-}" ]] || \
+    die "recorded commit does not match repository HEAD"
+ACTUAL_BRANCH=$(git -C "$REPO" branch --show-current) || \
+    die "cannot read recorded repository branch"
+if [[ -n "$ACTUAL_BRANCH" && "$ACTUAL_BRANCH" != "$EXPECTED_BRANCH" ]]; then
+    die "branch mismatch: expected $EXPECTED_BRANCH or detached HEAD, got $ACTUAL_BRANCH"
+fi
+git -C "$REPO" merge-base --is-ancestor \
+    "$REQUIRED_LAYOUT_COMMIT" "$ACTUAL_COMMIT" || \
+    die "required layout commit is not an ancestor"
+[[ -z "$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)" ]] || \
+    die "recorded repository working tree is not clean"
+[[ "${PRODUCER_KV_BUFFER_DEVICE:-}" == cuda ]] || die "producer buffer is not CUDA"
+[[ "${CONSUMER_KV_BUFFER_DEVICE:-}" == cpu ]] || die "consumer buffer is not CPU"
+[[ "${PRODUCER_LOCAL_MEMORY_TYPE:-}" == VRAM ]] || die "producer memory is not VRAM"
+[[ "${CONSUMER_LOCAL_MEMORY_TYPE:-}" == DRAM ]] || die "consumer local memory is not DRAM"
+[[ "${CONSUMER_REMOTE_MEMORY_TYPE:-}" == VRAM ]] || die "consumer remote memory is not VRAM"
 for port in "${PREFILL_PORT:-}" "${DECODE_PORT:-}" "${PROXY_PORT:-}"; do
     [[ "$port" =~ ^[0-9]+$ ]] || die "runtime.env contains an invalid HTTP port"
 done
-CUDA_PY=${CUDA_PY:-$DEFAULT_CUDA_PY}
-[[ -x "$CUDA_PY" ]] || die "CUDA Python is unavailable"
+[[ -x "${CUDA_PY:-}" ]] || die "recorded CUDA_PY is unavailable"
+for pid in "${PREFILL_PID:-}" "${DECODE_PID:-}" "${PROXY_PID:-}"; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || die "pids.env contains an invalid PID"
+    kill -0 "$pid" 2>/dev/null || die "recorded server PID $pid is not running"
+done
 
-export RESULT_DIR PREFILL_PORT DECODE_PORT PROXY_PORT MODEL_NAME PROMPT_SOURCE
+export RESULT_DIR PREFILL_PORT DECODE_PORT PROXY_PORT MODEL_NAME
 export WARMUP_REQUESTS MEASURE_REQUESTS CONCURRENCY MAX_TOKENS PROMPT_MODE
 "$CUDA_PY" - <<'PY'
 from __future__ import annotations
@@ -97,7 +108,6 @@ prefill_port = int(os.environ["PREFILL_PORT"])
 decode_port = int(os.environ["DECODE_PORT"])
 proxy_port = int(os.environ["PROXY_PORT"])
 model = os.environ.get("MODEL_NAME", "Qwen/Qwen3-0.6B")
-prompt_source = os.environ["PROMPT_SOURCE"]
 warmup_requests = int(os.environ["WARMUP_REQUESTS"])
 measure_requests = int(os.environ["MEASURE_REQUESTS"])
 concurrency = int(os.environ["CONCURRENCY"])
@@ -107,22 +117,23 @@ results_path = os.path.join(result_dir, "workload_results.jsonl")
 summary_path = os.path.join(result_dir, "workload_summary.txt")
 run_id = f"profile-workload-{uuid.uuid4()}"
 
-with open(prompt_source, encoding="utf-8") as handle:
-    prompt_doc = json.load(handle)
 prompt_id = 2 if prompt_mode == "short" else 4
-matches = [row for row in prompt_doc.get("prompts", []) if int(row.get("id", -1)) == prompt_id]
-if len(matches) != 1:
-    raise SystemExit(f"prompt {prompt_id} is missing or duplicated in {prompt_source}")
-prompt_row = matches[0]
-prompt = prompt_row["prompt"]
-prompt_sha256 = prompt_row["sha256_utf8"]
+prompt = (
+    "Complete the sequence: 1, 1, 2, 3, 5,"
+    if prompt_id == 2
+    else (
+        "A clear glass of water rests on the wooden table. " * 29
+        + "Continue with the next three words only:"
+    )
+)
 expected_prompt_sha256 = {
     2: "99c6c5a7e43544bac9573914b469b0391ad40d529fb1ad137276bef173dc7116",
     4: "57242b91f80632b4eec84b172bfe170fa52b0d33940af0b59a9a43be51889921",
 }[prompt_id]
 actual_prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-if prompt_sha256 != expected_prompt_sha256 or actual_prompt_sha256 != expected_prompt_sha256:
-    raise SystemExit(f"prompt {prompt_id} content/checksum differs from the validated source")
+if actual_prompt_sha256 != expected_prompt_sha256:
+    raise SystemExit(f"embedded prompt {prompt_id} checksum mismatch")
+prompt_sha256 = actual_prompt_sha256
 
 def get_ready(url: str, label: str) -> None:
     try:
