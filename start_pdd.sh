@@ -288,7 +288,7 @@ PRODUCER_CONFIG=$(printf \
     '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_buffer_device":"cuda","kv_load_failure_policy":"fail","engine_id":"%s","kv_connector_extra_config":{"kv_recompute_threshold":0}}' \
     "$PREFILL_ENGINE_ID")
 CONSUMER_CONFIG=$(printf \
-    '{"kv_connector":"RblnNixlConnector","kv_role":"kv_consumer","kv_buffer_device":"cpu","kv_load_failure_policy":"fail","engine_id":"%s","kv_connector_extra_config":{"kv_recompute_threshold":0,"remote_nixl_memory_type":"VRAM"}}' \
+    '{"kv_connector":"RblnNixlConnector","kv_role":"kv_consumer","kv_buffer_device":"cpu","kv_load_failure_policy":"fail","engine_id":"%s","kv_connector_extra_config":{"kv_recompute_threshold":0}}' \
     "$DECODE_ENGINE_ID")
 
 RUNTIME_FILE="$RESULT_DIR/runtime.env"

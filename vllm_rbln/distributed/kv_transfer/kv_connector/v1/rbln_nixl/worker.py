@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -103,30 +101,6 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             logger.info(
                 "RblnNixlConnectorWorker: nixl-rbln not available — "
                 "using upstream NIXL (UCX) on the host-bounce path."
-            )
-
-        # NixlAgentMetadata does not carry the remote memory type. Upstream
-        # therefore prepares remote descriptors with the local worker's
-        # memory type, which is wrong for CUDA-prefill (VRAM) -> RBLN-decode
-        # host receive (local DRAM). Keep the old local-type behavior by
-        # default and allow the producer's type to be stated explicitly.
-        kv_transfer_config = vllm_config.kv_transfer_config
-        extra_config = getattr(
-            kv_transfer_config, "kv_connector_extra_config", None
-        )
-        self._remote_nixl_memory_type = None
-        if isinstance(extra_config, Mapping) and (
-            "remote_nixl_memory_type" in extra_config
-        ):
-            self._remote_nixl_memory_type = (
-                kv_transfer_config.get_from_extra_config(
-                    "remote_nixl_memory_type", None
-                )
-            )
-        if self._remote_nixl_memory_type not in (None, "DRAM", "VRAM"):
-            raise ValueError(
-                "remote_nixl_memory_type must be either 'DRAM' or 'VRAM'; "
-                f"got {self._remote_nixl_memory_type!r}."
             )
 
         # `RblnPlatform.device_type = "cpu"` makes upstream skip the host
@@ -520,92 +494,22 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             blocks_data,
         )
 
-    @contextmanager
-    def _use_remote_nixl_memory_type(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_size: int,
-    ) -> Iterator[None]:
-        """Select the producer memory type only while preparing remote descs.
-
-        Upstream may also prepare local descriptors for heterogeneous TP or
-        block sizes inside ``add_remote_agent``. Limit a differing remote type
-        to a topology where that code cannot run, so local descriptors and
-        registration continue to use the consumer's DRAM type.
-        """
-        remote_memory_type = self._remote_nixl_memory_type
-        if remote_memory_type is None:
-            yield
-            return
-        if remote_memory_type == self.nixl_memory_type:
-            yield
-            return
-
-        if (
-            self.kv_buffer_device != "cpu"
-            or not self.use_host_buffer
-            or self.nixl_memory_type != "DRAM"
-            or remote_memory_type != "VRAM"
-            or self._use_rbln_nixl_backend
-        ):
-            raise NotImplementedError(
-                "The remote VRAM descriptor override is limited to the "
-                "UCX CUDA-prefill -> RBLN CPU host-receive path."
-            )
-        if self._sw_ratio is not None:
-            raise NotImplementedError(
-                "remote_nixl_memory_type is not supported together with "
-                "VLLM_RBLN_NIXL_SWA_VIEW_OPT."
-            )
-        if remote_tp_size != self.world_size:
-            raise NotImplementedError(
-                "remote_nixl_memory_type currently requires matching "
-                "prefill/decode tensor parallel sizes; "
-                f"got remote TP={remote_tp_size}, local TP={self.world_size}."
-            )
-        if nixl_agent_meta.block_size != self.block_size:
-            raise NotImplementedError(
-                "remote_nixl_memory_type currently requires matching "
-                "prefill/decode block sizes; "
-                f"got remote={nixl_agent_meta.block_size}, "
-                f"local={self.block_size}."
-            )
-
-        local_memory_type = self.nixl_memory_type
-        logger.info(
-            "Preparing remote NIXL descriptors as %s while local receive "
-            "memory remains %s.",
-            remote_memory_type,
-            local_memory_type,
-        )
-        self.nixl_memory_type = remote_memory_type
-        try:
-            yield
-        finally:
-            self.nixl_memory_type = local_memory_type
-
     def add_remote_agent(
         self,
         nixl_agent_meta: NixlAgentMetadata,
         remote_tp_rank: int = 0,
         remote_tp_size: int = 1,
     ) -> str:
-        with self._use_remote_nixl_memory_type(nixl_agent_meta, remote_tp_size):
-            return self._add_remote_agent(
-                nixl_agent_meta, remote_tp_rank, remote_tp_size
-            )
-
-    def _add_remote_agent(
-        self,
-        nixl_agent_meta: NixlAgentMetadata,
-        remote_tp_rank: int,
-        remote_tp_size: int,
-    ) -> str:
         if self._sw_ratio is None:
-            # No SWA view opt: upstream handles Full-only remote descs.
-            return super().add_remote_agent(
-                nixl_agent_meta, remote_tp_rank, remote_tp_size
-            )
+            # The producer on this branch is CUDA VRAM. Upstream otherwise
+            # reuses this consumer's local DRAM type for remote descriptors.
+            self.nixl_memory_type = "VRAM"
+            try:
+                return super().add_remote_agent(
+                    nixl_agent_meta, remote_tp_rank, remote_tp_size
+                )
+            finally:
+                self.nixl_memory_type = "DRAM"
         engine_id = nixl_agent_meta.engine_id
         if remote_tp_rank in self._remote_agents.get(engine_id, {}):
             logger.debug(
@@ -714,7 +618,7 @@ class RblnNixlConnectorWorker(NixlConnectorWorker):
             self.tp_rank,
         )
 
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, "VRAM")
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
