@@ -8,7 +8,12 @@ on:
 
 jobs:
   pdd-test:
+    name: PDD Test
     runs-on: self-hosted
+
+    env:
+      CUDA_PY: /home/jiwon_lee/.venvs/official0111-cuda-20260903-121127/bin/python3
+      RBLN_PY: /home/jiwon_lee/.venvs/official0111-rbln-20260903-121127/bin/python3
 
     steps:
       - name: Checkout repository
