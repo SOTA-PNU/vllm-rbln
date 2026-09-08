@@ -1,0 +1,38 @@
+name: PDD test
+
+on:
+  push:
+    branches:
+      - 0.11.1-2_native_dtype
+  workflow_dispatch:
+
+jobs:
+  pdd-test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Start PDD
+        run: |
+          set -euo pipefail
+
+          ./start_pdd.sh | tee "$RUNNER_TEMP/start_pdd.out"
+          grep '^RESULT_DIR=' "$RUNNER_TEMP/start_pdd.out" >>"$GITHUB_ENV"
+
+      - name: Check PDD test results
+        run: ./check_correctness.sh
+
+      - name: Stop PDD
+        if: ${{ always() }}
+        run: ./stop_pdd.sh
+
+      - name: Upload PDD results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdd-results
+          path: ~/vllm-rbln-profile-results/
