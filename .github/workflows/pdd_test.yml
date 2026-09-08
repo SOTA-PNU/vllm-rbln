@@ -11,10 +11,6 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Check runner account
-        run: |
-          whoami
-          echo "HOME=$HOME"
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
