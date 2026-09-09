@@ -1,4 +1,4 @@
-name: PDD test
+name: PDD Test
 
 on:
   push:
@@ -7,14 +7,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  pdd-test:
-    name: PDD Test
+  start-pdd:
+    name: Start PDD
     runs-on: self-hosted
-
     env:
       CUDA_PY: /home/jiwon_lee/.venvs/official0111-cuda-20260903-121127/bin/python3
       RBLN_PY: /home/jiwon_lee/.venvs/official0111-rbln-20260903-121127/bin/python3
-
+    outputs:
+      result_dir: ${{ steps.start.outputs.result_dir }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,22 +22,58 @@ jobs:
           fetch-depth: 0
 
       - name: Start PDD
+        id: start
         run: |
           set -euo pipefail
+          unset RUNNER_TRACKING_ID
 
           ./start_pdd.sh | tee "$RUNNER_TEMP/start_pdd.out"
-          grep '^RESULT_DIR=' "$RUNNER_TEMP/start_pdd.out" >>"$GITHUB_ENV"
+
+          RESULT_DIR=$(grep '^RESULT_DIR=' "$RUNNER_TEMP/start_pdd.out" | cut -d= -f2-)
+          echo "result_dir=$RESULT_DIR" >> "$GITHUB_OUTPUT"
+
+  check-pdd:
+    name: Check PDD test results
+    needs: start-pdd
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Check PDD test results
+        env:
+          RESULT_DIR: ${{ needs.start-pdd.outputs.result_dir }}
         run: ./check_correctness.sh
 
+  stop-pdd:
+    name: Stop PDD
+    needs:
+      - start-pdd
+      - check-pdd
+    if: ${{ always() }}
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Stop PDD
-        if: ${{ always() }}
+        env:
+          RESULT_DIR: ${{ needs.start-pdd.outputs.result_dir }}
         run: ./stop_pdd.sh
 
+  upload-results:
+    name: Upload PDD results
+    needs:
+      - start-pdd
+      - check-pdd
+      - stop-pdd
+    if: ${{ always() }}
+    runs-on: self-hosted
+    steps:
       - name: Upload PDD results
-        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: pdd-results
-          path: ~/vllm-rbln-profile-results/
+          path: |
+            ~/vllm-rbln-profile-results/
+            !~/vllm-rbln-profile-results/**/cache/**
