@@ -22,6 +22,13 @@ concurrency:
   group: pdd-test
   cancel-in-progress: false
 
+env:
+  # Report to the lab CI/CD HUD (https://sota.pusan.ac.kr/cicd/). HUD steps never change this CI's result.
+  # gpu = GPU-only P/D baseline, pdd = CUDA prefill + RBLN decode.
+  HUD_URL: ${{ vars.HUD_URL || 'https://sota.pusan.ac.kr/cicd' }}
+  HUD_TOKEN: ${{ secrets.HUD_TOKEN }}
+  HUD_EXPECTED_HW: gpu,pdd
+
 jobs:
   gpu-baseline:
     name: GPU Baseline
@@ -31,7 +38,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: "[HUD] Start"
+        continue-on-error: true
+        shell: bash
+        run: |
+          curl -fsS --max-time 20 "${HUD_URL}/client/hud_report.py" -o "${RUNNER_TEMP}/hud_report.py"
+          HUD="python3 ${RUNNER_TEMP}/hud_report.py"
+          export RUN_ID=$($HUD start --commit "${GITHUB_SHA:0:7} (Run ${GITHUB_RUN_ATTEMPT})" --repo "${GITHUB_REPOSITORY}" \
+            --expected-hw "${HUD_EXPECTED_HW}" \
+            --url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}")
+          $HUD job lint gpu skipped
+          $HUD job build gpu running
+          $HUD job benchmark gpu skipped
+
       - name: Prepare environments
+        id: prepare
         shell: bash
         run: |
           set -euo pipefail
@@ -40,6 +61,7 @@ jobs:
           bash scripts/setup_gpu_pd_env.sh
 
       - name: Run GPU baseline
+        id: run
         shell: bash
         env:
           VLLM_LOGGING_LEVEL: DEBUG
@@ -48,6 +70,21 @@ jobs:
           python3 run_gpu_pdd_once.py \
             --ready-timeout-sec 1200 \
             --log-dir "${{ github.workspace }}/pdd_logs/gpu-baseline"
+
+      - name: "[HUD] Report"
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          HUD="python3 ${RUNNER_TEMP}/hud_report.py"
+          $HUD job build gpu "${{ steps.prepare.outcome }}"
+          $HUD job correctness gpu "${{ steps.run.outcome }}"
+          if [ "${{ steps.prepare.outcome }}" = failure ]; then
+            $HUD failure gpu build --summary "Preparing the environments failed (see CI log)"
+          elif [ "${{ steps.run.outcome }}" = failure ]; then
+            $HUD failure gpu correctness --summary "GPU baseline run failed (see CI log)"
+          fi
+          $HUD finish "${{ job.status == 'success' && 'success' || 'failure' }}"
 
       - name: Upload GPU baseline
         if: always()
@@ -67,7 +104,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: "[HUD] Start"
+        continue-on-error: true
+        shell: bash
+        run: |
+          curl -fsS --max-time 20 "${HUD_URL}/client/hud_report.py" -o "${RUNNER_TEMP}/hud_report.py"
+          HUD="python3 ${RUNNER_TEMP}/hud_report.py"
+          export RUN_ID=$($HUD start --commit "${GITHUB_SHA:0:7} (Run ${GITHUB_RUN_ATTEMPT})" --repo "${GITHUB_REPOSITORY}" \
+            --expected-hw "${HUD_EXPECTED_HW}" \
+            --url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}")
+          $HUD job lint pdd skipped
+          $HUD job build pdd running
+          $HUD job benchmark pdd skipped
+
       - name: Prepare environments
+        id: prepare
         shell: bash
         run: |
           set -euo pipefail
@@ -78,6 +129,7 @@ jobs:
             'import rebel; print(f"rebel import OK: {rebel.__file__}")'
 
       - name: Run disaggregated P/D
+        id: run
         shell: bash
         env:
           VLLM_LOGGING_LEVEL: DEBUG
@@ -97,6 +149,21 @@ jobs:
             echo "RBLN decode log does not confirm an external KV transfer" >&2
             exit 1
           fi
+
+      - name: "[HUD] Report"
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          HUD="python3 ${RUNNER_TEMP}/hud_report.py"
+          $HUD job build pdd "${{ steps.prepare.outcome }}"
+          $HUD job correctness pdd "${{ steps.run.outcome }}"
+          if [ "${{ steps.prepare.outcome }}" = failure ]; then
+            $HUD failure pdd build --summary "Preparing the environments failed (see CI log)"
+          elif [ "${{ steps.run.outcome }}" = failure ]; then
+            $HUD failure pdd correctness --summary "Disaggregated P/D run failed (see CI log)"
+          fi
+          $HUD finish "${{ job.status == 'success' && 'success' || 'failure' }}"
 
       - name: Upload disaggregated P/D
         if: always()
