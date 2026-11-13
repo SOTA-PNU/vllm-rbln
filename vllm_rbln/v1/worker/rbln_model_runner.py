@@ -124,6 +124,10 @@ from vllm_rbln.forward_context import RBLNDPMetadata
 from vllm_rbln.logger import init_logger
 from vllm_rbln.lora.inputs import LoRAInputs
 from vllm_rbln.lora.mask import LoRAMask
+from vllm_rbln.runtime_markers import (
+    correlation_id_from_request_id,
+    get_runtime_marker_sink,
+)
 from vllm_rbln.v1.attention.backends.flash_attention import (
     RBLNFlashAttentionMetadataBuilder,
 )
@@ -148,6 +152,29 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
 
 logger = init_logger(__name__)
+
+
+def _get_warmup_prompt_tokens(
+    requested_prompt_tokens: int,
+    max_model_len: int,
+    warmup_sample_tokens: int,
+) -> int:
+    """Reserve model-length capacity for tokens sampled during warm-up."""
+    if requested_prompt_tokens < 1:
+        raise ValueError("Warm-up prompt length must be at least 1 token.")
+    if max_model_len < 1:
+        raise ValueError("max_model_len must be at least 1 token.")
+    if warmup_sample_tokens < 0:
+        raise ValueError("Warm-up sample token count cannot be negative.")
+
+    max_prompt_tokens = max_model_len - warmup_sample_tokens
+    if max_prompt_tokens < 1:
+        raise ValueError(
+            "Warm-up sampling requires at least one prompt token within "
+            f"max_model_len={max_model_len}, but reserves "
+            f"{warmup_sample_tokens} sampled token(s)."
+        )
+    return min(requested_prompt_tokens, max_prompt_tokens)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -376,6 +403,9 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        self._runtime_marker_sink = get_runtime_marker_sink()
+        self._runtime_marker_step_indices: dict[str, int] = {}
+        self._runtime_marker_active_requests: set[str] = set()
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -689,6 +719,8 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._runtime_marker_step_indices.pop(req_id, None)
+            self._runtime_marker_active_requests.discard(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1889,6 +1921,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.scheduler_config.enable_chunked_prefill
             else self.model_config.max_model_len
         )
+        warmup_sample_tokens = 0 if self.is_pooling_model else 1
+        prefill_seq_len = _get_warmup_prompt_tokens(
+            prefill_seq_len,
+            self.model_config.max_model_len,
+            warmup_sample_tokens,
+        )
         dummy_prefill_requests: list[NewRequestData] = []
         dummy_prefill_num_scheduled_tokens: dict[str, int] = {}
         self._add_dummy_requests(
@@ -2696,6 +2734,48 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else nullcontext()
         )
 
+    def _runtime_marker_steps(
+        self, scheduler_output: SchedulerOutput
+    ) -> list[tuple[str, int]]:
+        """Return real request/step pairs, excluding startup dummy runs."""
+        scheduled_request_ids = tuple(scheduler_output.num_scheduled_tokens)
+        if scheduler_output.kv_connector_metadata is not None:
+            self._runtime_marker_active_requests.update(scheduled_request_ids)
+        return [
+            (
+                request_id,
+                self._runtime_marker_step_indices.get(request_id, 0),
+            )
+            for request_id in scheduled_request_ids
+            if request_id in self._runtime_marker_active_requests
+            if self._runtime_marker_sink.enabled_for(request_id)
+        ]
+
+    def _emit_runtime_step_markers(
+        self,
+        event_name: str,
+        request_steps: Sequence[tuple[str, int]],
+        *,
+        phase: str,
+        source: str,
+    ) -> None:
+        for request_id, step_index in request_steps:
+            self._runtime_marker_sink.emit(
+                event_name,
+                request_id,
+                phase=phase,
+                source=source,
+                process_role="npu_model_runner",
+                correlation_id=correlation_id_from_request_id(request_id),
+                attributes={"decode.step_index": step_index},
+            )
+
+    def _advance_runtime_marker_steps(
+        self, request_steps: Sequence[tuple[str, int]]
+    ) -> None:
+        for request_id, step_index in request_steps:
+            self._runtime_marker_step_indices[request_id] = step_index + 1
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2901,7 +2981,14 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 LoRAInputs.set_sampler_indices_padded(sampler_indices_padded)
 
             model_start_time = time.perf_counter()
+            runtime_request_steps = self._runtime_marker_steps(scheduler_output)
             with capture_ctx as reports:
+                self._emit_runtime_step_markers(
+                    "decode_step_start",
+                    runtime_request_steps,
+                    phase="decode",
+                    source="RBLNModelRunner.model_executable",
+                )
                 model_output = self.model_executable(
                     input_ids=input_ids,
                     positions=positions,
@@ -2909,6 +2996,12 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     selected_token_indices=token_indices,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
+                )
+                self._emit_runtime_step_markers(
+                    "decode_step_end",
+                    runtime_request_steps,
+                    phase="decode",
+                    source="RBLNModelRunner.model_executable",
                 )
             if self.performance_tracker is not None:
                 # Record performance metrics
@@ -3113,8 +3206,22 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             logits = logits.to(original_dtype)
 
+        runtime_request_steps = self._runtime_marker_steps(scheduler_output)
         with record_function_or_nullcontext("Sample"):
+            self._emit_runtime_step_markers(
+                "sampling_start",
+                runtime_request_steps,
+                phase="sampling",
+                source="RBLNModelRunner._sample",
+            )
             sampler_output = self._sample(logits, spec_decode_metadata)
+            self._emit_runtime_step_markers(
+                "sampling_end",
+                runtime_request_steps,
+                phase="sampling",
+                source="RBLNModelRunner._sample",
+            )
+        self._advance_runtime_marker_steps(runtime_request_steps)
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
